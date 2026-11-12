@@ -1,0 +1,62 @@
+{
+  "active_push_enabled": true,
+  "target_conv_id": "conv_rec_1776439659724_7eba19",
+  "timezone": "Asia/Shanghai",
+  "tick_seconds": 60,
+  "blackout": {
+    "start": "01:30",
+    "end": "08:00"
+  },
+  "random_interval_minutes": {
+    "min": 120,
+    "max": 360
+  },
+  "user_active_reset_minutes": 10,
+  "cooldown_minutes": 90,
+  "daily_limits": {
+    "stage1_calls": 30,
+    "stage2_calls": 6,
+    "delivered": 5
+  },
+  "directive_skip_gate": true,
+  "gate_fail_streak_limit": 3,
+  "stage1": {
+    "model": "deepseek-chat",
+    "temperature": 0.4,
+    "max_output_tokens": 200
+  },
+  "stage2": {
+    "model": "",
+    "temperature": 1.0,
+    "max_output_tokens": 2048,
+    "history_tail": 40
+  },
+  "anomaly": {
+    "hr_high_bpm": 110,
+    "hr_min_delta_steps": 50,
+    "hr_sustain_minutes": 3,
+    "hr_min_gap_minutes": 180,
+    "screen_single_app_minutes": 180,
+    "screen_min_gap_minutes": 240,
+    "screen_quiet_hours": {
+      "start": "23:30",
+      "end": "01:30"
+    }
+  },
+  "followup": {
+    "enabled": true,
+    "categories": [
+      "screen_time_audit",
+      "homework_progress",
+      "brat_tease"
+    ],
+    "if_no_reply_minutes": 15,
+    "delay_minutes": 20,
+    "max_times": 1,
+    "max_output_tokens": 300
+  },
+  "delivery": {
+    "channel": "termux",
+    "keep_pending_max": 50
+  }
+}

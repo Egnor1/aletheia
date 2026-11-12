@@ -1,0 +1,8 @@
+# 网关（server.js）只用 Node 标准库，无需 npm 依赖。
+# 以下是 Python 侧（RAG 微服务 + 记忆管道）的依赖，建议装在 venv 里：
+#   python3 -m venv ~/rag-env && source ~/rag-env/bin/activate
+#   pip install -r requirements.txt
+chromadb>=0.4
+sentence-transformers>=2.2
+openai>=1.0
+google-generativeai>=0.5

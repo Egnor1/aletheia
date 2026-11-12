@@ -1,0 +1,60 @@
+# ============================================================
+# 这个仓库是「代码 + 文档」，**不含任何私人数据与密钥**。
+# 下面每一段都是踩过之后加的护栏，动之前先想清楚会不会泄露。
+# ============================================================
+
+# ===== 密钥 / 环境 =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+proactive.env
+**/runtime-keys.json
+proactive/state/
+
+# ===== 私有数据（绝对不要进仓库）=====
+# 对话 / 日志 / 摘要
+conversations/
+logs/
+summaries/
+*.jsonl
+# 向量库与记忆备份（上万条私人记忆）
+chroma_db/
+chroma_backup.json
+core_candidates.json
+core_shortlist.json
+fix_pronouns_log.jsonl
+# 健康 / 体重 / 屏幕时间 / 记账
+health/
+audit/
+*.db
+Gadgetbridge*
+# 私密导出 / 截图 / 来源不明的大文件
+*convs-*.json
+Screenshot_*.jpg
+Screenshot_*.png
+Agentic Use & Security Warning*
+*.msi
+
+# ===== 依赖 / 构建产物 =====
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+
+# ===== 个人向内部文档（含真实服务器信息 / 个人参数 / 私密对话摘要，仅本地保留）=====
+CLAUDE.md
+WORKLOG.md
+PROACTIVE_DESIGN.md
+
+# ===== 杂项 =====
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,13 @@
+{
+  "weights": {
+    "similarity": 0.40,
+    "time_decay": 0.25,
+    "frequency": 0.10,
+    "emotion": 0.15,
+    "type": 0.10
+  },
+  "time_decay_rate": 0.05,
+  "candidate_pool": 20,
+  "final_top_k": 5,
+  "max_distance": 1.5
+}
