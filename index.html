@@ -726,7 +726,21 @@
     padding: 14px 16px; display: flex; flex-direction: column; gap: 12px;
   }
   .audit-amount-row { display: flex; align-items: baseline; gap: 8px; }
-  .audit-amount-cur { font-size: 20px; color: #777; font-family: 'Fira Code', monospace; }
+  .audit-amount-cur { font-size: 20px; color: #777; font-family: 'Fira Code', monospace; transition: color 0.15s; }
+  .audit-amount-row.income .audit-amount-cur { color: #6fcf8f; }
+  /* 支出 / 入账 切换（复用 pie 那套分段控件观感） */
+  .audit-types { display: flex; margin-left: auto; align-self: center; flex-shrink: 0; }
+  .audit-type {
+    font-size: 11px; padding: 4px 12px; color: #888; background: transparent;
+    border: 1px solid #333; cursor: pointer; font-family: inherit; line-height: 1.4;
+  }
+  .audit-type:first-child { border-radius: 4px 0 0 4px; }
+  .audit-type:last-child { border-radius: 0 4px 4px 0; border-left: none; }
+  .audit-type.active { background: #2a2a2a; color: #ddd; border-color: #555; }
+  .audit-type.active.income { background: #1e3527; border-color: #3d7a55; color: #8ce0a8; }
+  .audit-submit.income { background: #2f6b47; border-color: #3d7a55; }
+  .audit-submit.income:hover { background: #3a8055; }
+  .audit-item-amt.income { color: #6fcf8f; }
   .audit-amount-input {
     flex: 1; min-width: 0; background: transparent; border: none;
     border-bottom: 1px solid #3a3a3a; color: #f0f0f0;
@@ -843,9 +857,11 @@
   .audit-filters select:focus, .audit-filters input:focus { border-color: #555; }
   .audit-ledger-head {
     display: flex; justify-content: space-between; align-items: baseline;
+    flex-wrap: wrap; row-gap: 2px;
     font-size: 12px; color: #888; border-bottom: 1px solid #2a2a2a;
     padding-bottom: 6px;
   }
+  .audit-ledger-head .sum { text-align: right; margin-left: auto; }
   .audit-ledger-head .sum { color: #bbb; font-family: 'Fira Code', monospace; }
 
   .audit-ledger { display: flex; flex-direction: column; gap: 14px; }
@@ -1949,10 +1965,14 @@
 
       <!-- 快速录入 -->
       <div class="audit-entry">
-        <div class="audit-amount-row">
+        <div class="audit-amount-row" id="auditAmountRow">
           <span class="audit-amount-cur">¥</span>
           <input class="audit-amount-input" id="auditAmount" inputmode="decimal"
                  autocomplete="off" placeholder="0.00" aria-label="金额" />
+          <div class="audit-types">
+            <button class="audit-type active" id="auditTypeExpense" onclick="auditSetType('expense')">支出</button>
+            <button class="audit-type" id="auditTypeIncome" onclick="auditSetType('income')">入账</button>
+          </div>
         </div>
         <div class="audit-cats" id="auditCats"></div>
         <div class="audit-row-inputs">
@@ -1982,7 +2002,7 @@
         </div>
         <div class="audit-chart-card">
           <div class="audit-chart-head">
-            <span class="audit-chart-title">分类占比</span>
+            <span class="audit-chart-title">支出分类占比</span>
             <span class="audit-chart-sub" id="auditPieSub"></span>
             <div class="audit-pie-modes">
               <div class="audit-pie-mode active" id="auditPieModeMonth" onclick="auditSetPieMode('month')">按月</div>
@@ -6125,13 +6145,18 @@ function stopGeneration() {
 // ===== Audit (记账) =====
 // 金额真值始终是「分」（整数）；前端展示/提交都走整数运算，不碰浮点
 const AUDIT_CATS = ['餐饮','零食','饮料','医疗','教育','日用','服饰','娱乐','交通','购物','其它杂项'];
+// 入账（收入）分类：和支出共用一套流水/筛选/存储，只按 type 区分
+const AUDIT_INCOME_CATS = ['工资','兼职','红包','报销','退款','理财','其它收入'];
 const AUDIT_CAT_COLORS = {
   '餐饮':'#d9a05b','零食':'#cf8fb0','饮料':'#5aa9c9','医疗':'#d97a7a','教育':'#7c9fdf',
-  '日用':'#9ec27a','服饰':'#b08ee0','娱乐':'#dcc05f','交通':'#63bfa4','购物':'#c98fa0','其它杂项':'#8f8f8f'
+  '日用':'#9ec27a','服饰':'#b08ee0','娱乐':'#dcc05f','交通':'#63bfa4','购物':'#c98fa0','其它杂项':'#8f8f8f',
+  // 入账用偏绿的色系，一眼和支出区分开
+  '工资':'#5fbf8a','兼职':'#7ccf9e','红包':'#e0a2a2','报销':'#6fb3c9','退款':'#8fbf6f','理财':'#c9b46f','其它收入':'#8f9f8f'
 };
+function auditCatsOf(type) { return type === 'income' ? AUDIT_INCOME_CATS : AUDIT_CATS; }
 const AUDIT_PAGE = 30;
 const AUDIT_MAX_CENTS = 100 * 1000 * 1000;
-const auditState = { cat: '餐饮', month: '', category: '', items: [], total: 0, filterSum: 0, loading: false, pendingReset: false, seq: 0, bound: false };
+const auditState = { type: 'expense', cat: '餐饮', month: '', category: '', items: [], total: 0, filterSum: 0, filterIncome: 0, loading: false, pendingReset: false, seq: 0, bound: false };
 let auditDeletePending = null, auditDeleteTimer = null, auditMsgTimer = null;
 
 function auditCatColor(c) { return AUDIT_CAT_COLORS[c] || '#8f8f8f'; }
@@ -6201,7 +6226,7 @@ function auditMsg(text, isErr) {
 function auditRenderCats() {
   const box = document.getElementById('auditCats');
   if (!box) return;
-  box.innerHTML = AUDIT_CATS.map(c => {
+  box.innerHTML = auditCatsOf(auditState.type).map(c => {
     const color = auditCatColor(c);
     const active = c === auditState.cat;
     const style = active ? `background:${color}22;border-color:${color}99;color:${color}` : '';
@@ -6212,6 +6237,25 @@ function auditRenderCats() {
 function auditPickCat(c) {
   auditState.cat = c;
   auditRenderCats();
+}
+
+// 支出 / 入账 切换：只换分类胶囊和颜色，其余（金额/备注/时间/提交）完全一样
+function auditSetType(type) {
+  auditState.type = type === 'income' ? 'income' : 'expense';
+  const isIncome = auditState.type === 'income';
+  const cats = auditCatsOf(auditState.type);
+  if (!cats.includes(auditState.cat)) auditState.cat = cats[0];
+  const eb = document.getElementById('auditTypeExpense');
+  const ib = document.getElementById('auditTypeIncome');
+  if (eb) eb.classList.toggle('active', !isIncome);
+  if (ib) { ib.classList.toggle('active', isIncome); ib.classList.toggle('income', isIncome); }
+  const row = document.getElementById('auditAmountRow');
+  if (row) row.classList.toggle('income', isIncome);
+  const btn = document.getElementById('auditSubmit');
+  if (btn) { btn.classList.toggle('income', isIncome); btn.textContent = isIncome ? '记入账' : '记一笔'; }
+  auditRenderCats();
+  const amt = document.getElementById('auditAmount');
+  if (amt) amt.focus();
 }
 
 function auditBindOnce() {
@@ -6237,7 +6281,8 @@ function auditBindOnce() {
   // 分类下拉（只建一次）
   const catSel = document.getElementById('auditCatSel');
   catSel.innerHTML = '<option value="">全部分类</option>'
-    + AUDIT_CATS.map(c => `<option value="${c}">${c}</option>`).join('');
+    + `<optgroup label="支出">${AUDIT_CATS.map(c => `<option value="${c}">${c}</option>`).join('')}</optgroup>`
+    + `<optgroup label="入账">${AUDIT_INCOME_CATS.map(c => `<option value="${c}">${c}</option>`).join('')}</optgroup>`;
   // 横竖屏 / 窗口尺寸变化后重画图表（面板没开就不折腾）
   window.addEventListener('resize', () => {
     const ov = document.getElementById('auditOverlay');
@@ -6260,10 +6305,13 @@ function auditRenderSummary(sum) {
   const mEl = document.getElementById('auditStatMonth');
   const tEl = document.getElementById('auditStatToday');
   const cEl = document.getElementById('auditStatTop');
+  const incomeSub = (cents) => (cents > 0 ? ` · 入账 ¥${auditYuan(cents)}` : '');
   mEl.innerHTML = `<span class="cur">¥</span>${auditYuan(sum.total_cents)}`;
-  document.getElementById('auditStatMonthSub').textContent = `${sum.count || 0} 笔`;
+  document.getElementById('auditStatMonthSub').textContent =
+    `${sum.count || 0} 笔${incomeSub(sum.income_cents || 0)}`;
   tEl.innerHTML = `<span class="cur">¥</span>${auditYuan(sum.today ? sum.today.total_cents : 0)}`;
-  document.getElementById('auditStatTodaySub').textContent = `${sum.today ? sum.today.count : 0} 笔`;
+  document.getElementById('auditStatTodaySub').textContent =
+    `${sum.today ? sum.today.count : 0} 笔${incomeSub(sum.today ? (sum.today.income_cents || 0) : 0)}`;
   if (sum.top_category) {
     const color = auditCatColor(sum.top_category.category);
     cEl.textContent = sum.top_category.category;
@@ -6286,7 +6334,8 @@ function auditRenderLedger() {
 
   const scope = auditState.month || '全部月份';
   label.textContent = `流水 · ${scope}${auditState.category ? ' · ' + auditState.category : ''}`;
-  sumEl.textContent = `${auditState.total} 笔 · ¥${auditYuan(auditState.filterSum)}`;
+  sumEl.textContent = `${auditState.total} 笔 · 支出 ¥${auditYuan(auditState.filterSum)}`
+    + (auditState.filterIncome > 0 ? ` · 入账 ¥${auditYuan(auditState.filterIncome)}` : '');
 
   const items = auditState.items;
   if (!items.length) {
@@ -6295,21 +6344,22 @@ function auditRenderLedger() {
     return;
   }
 
-  // 按天聚合（服务端已按时间倒序）
+  // 按天聚合（服务端已按时间倒序）；每天的小计把支出和入账分开算
   const groups = [];
   for (const it of items) {
     const day = auditDayKeyOf(it.timestamp);
     let g = groups[groups.length - 1];
-    if (!g || g.day !== day) { g = { day, items: [], cents: 0 }; groups.push(g); }
+    if (!g || g.day !== day) { g = { day, items: [], cents: 0, incomeCents: 0 }; groups.push(g); }
     g.items.push(it);
-    g.cents += it.amount_cents;
+    if (it.type === 'income') g.incomeCents += it.amount_cents;
+    else g.cents += it.amount_cents;
   }
 
   box.innerHTML = groups.map(g => `
     <div class="audit-day">
       <div class="audit-day-label">
         <span>${auditFmtDay(g.day)}</span>
-        <span class="t">${g.items.length} 笔 · ¥${auditYuan(g.cents)}</span>
+        <span class="t">${g.items.length} 笔 · 支出 ¥${auditYuan(g.cents)}${g.incomeCents > 0 ? ` · 入账 ¥${auditYuan(g.incomeCents)}` : ''}</span>
       </div>
       ${g.items.map(it => {
         const color = auditCatColor(it.category);
@@ -6319,7 +6369,7 @@ function auditRenderLedger() {
           <span class="audit-time">${auditTimeHM(it.timestamp)}</span>
           <span class="audit-tag" style="color:${color};border-color:${color}66;background:${color}14">${it.category}</span>
           <span class="audit-item-note" title="${note}">${note || '<span style="color:#555">—</span>'}</span>
-          <span class="audit-item-amt">-¥${auditYuan(it.amount_cents)}</span>
+          <span class="audit-item-amt${it.type === 'income' ? ' income' : ''}">${it.type === 'income' ? '+' : '-'}¥${auditYuan(it.amount_cents)}</span>
           <button class="audit-del${pending ? ' confirm' : ''}" title="${pending ? '再点一次删除' : '删除'}"
                   onclick="auditDelete('${it.id}', event)">${pending ? '确认?' : '&times;'}</button>
         </div>`;
@@ -6638,7 +6688,7 @@ async function auditRefresh(reset = true) {
   }
   auditState.loading = true;
   const seq = ++auditState.seq;
-  if (reset) { auditState.items = []; auditState.total = 0; auditState.filterSum = 0; }
+  if (reset) { auditState.items = []; auditState.total = 0; auditState.filterSum = 0; auditState.filterIncome = 0; }
   try {
     const params = new URLSearchParams({
       limit: String(AUDIT_PAGE),
@@ -6659,6 +6709,7 @@ async function auditRefresh(reset = true) {
     auditState.items = reset ? fresh : auditState.items.concat(fresh);
     auditState.total = list.total || 0;
     auditState.filterSum = list.total_amount_cents || 0;
+    auditState.filterIncome = list.income_amount_cents || 0;
     // 卡片固定看「本月」（current_month），图表跟着筛选走（顶层 range 字段）
     auditRenderSummary(sum && sum.current_month ? sum.current_month : sum);
     auditRenderCharts(sum);
@@ -6708,6 +6759,7 @@ async function auditSubmit() {
       body: JSON.stringify({
         amount_cents: cents,
         amount: raw,
+        type: auditState.type,
         category: auditState.cat,
         note,
         timestamp: ts,
@@ -6724,7 +6776,8 @@ async function auditSubmit() {
     const mk = auditMonthKeyOf(ts);
     const hidden = (auditState.month && auditState.month !== mk)
       || (auditState.category && auditState.category !== auditState.cat);
-    auditMsg(`已记 ¥${auditYuan(cents)} · ${auditState.cat}${hidden ? '（当前筛选看不到这笔）' : ''}`);
+    const isIncome = auditState.type === 'income';
+    auditMsg(`${isIncome ? '已入账' : '已记'} ¥${auditYuan(cents)} · ${auditState.cat}${hidden ? '（当前筛选看不到这笔）' : ''}`);
     auditRefresh(true);
   } catch (err) {
     auditMsg('保存失败：' + err.message, true);
@@ -6774,6 +6827,7 @@ function openAudit() {
   auditState.cat = auditState.cat || '餐饮';
   document.getElementById('auditCatSel').value = '';
   document.getElementById('auditDt').value = auditNowInputValue();  // 默认当前系统时间
+  auditSetType('expense');                     // 每次打开都从「支出」开始
   auditRenderCats();
   auditSyncMonthSelect([]);
   auditRefresh(true);
