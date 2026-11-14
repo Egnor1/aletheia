@@ -1761,6 +1761,19 @@ const WEATHER_REFRESH_MS = 10 * 60 * 1000;      // 每 10 分钟刷一次
 const WEATHER_STALE_MS = 90 * 60 * 1000;        // 超过 90 分钟没刷新成功就不注入（宁可不给，也别给假天气）
 const WEATHER_TZ = 'Asia/Shanghai';
 
+// Open-Meteo 各子域其实共用同一批边缘节点，按 SNI 路由。2026-11 实测：本机 DNS 把
+// api.open-meteo.com 只解析到 51.81.167.44（OVH），该 IP 从这里 TCP 全丢包（SYN 超时），
+// 但同集群的 152.53.84.73 / 5.9.98.12 / 178.63.121.29 都正常返回同一份 forecast。
+// 所以：直连失败就钉住这些 IP 重试（Host/SNI 不变，证书照旧校验）。
+// 可用 WEATHER_PIN_IPS=ip1,ip2 覆盖；换机房后可能要在服务器上重新探一批可达 IP。
+const WEATHER_PIN_IPS = String(process.env.WEATHER_PIN_IPS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const WEATHER_DEFAULT_PINS = {
+  // 顺序 = 尝试顺序，按实测延迟从快到慢（2026-11 服务器上 5.9.98.12 ≈160ms）
+  'api.open-meteo.com': ['5.9.98.12', '152.53.84.73', '178.63.121.29'],
+};
+const weatherPinnedIp = new Map();   // hostname → 最近一次成功的固定 IP
+
 // WMO weather code → 中文
 const WMO_DESC = {
   0: '晴', 1: '晴间多云', 2: '多云', 3: '阴',
@@ -1811,27 +1824,76 @@ function aqiLevel(aqi) {
   return '严重污染';
 }
 
-function httpsGetJson(url, timeoutMs = 6000) {
+function httpsGetJson(url, timeoutMs = 6000, pinIp = '') {
   return new Promise((resolve) => {
     let u;
     try { u = new URL(url); } catch { return resolve(null); }
-    const rq = https.request({
+    const opts = {
       hostname: u.hostname, port: 443, path: u.pathname + u.search, method: 'GET',
       headers: { 'Accept': 'application/json', 'User-Agent': 'aletheia-server/1.0' },
       timeout: timeoutMs,
-    }, (r) => {
+      // Node 20+ 默认开 autoSelectFamily，会把 lookup 调用改成 all:true（要求返回数组）；
+      // 关掉它，配合下面的 lookup 让「钉 IP」这条路行为可预测
+      autoSelectFamily: false,
+    };
+    // pinIp：跳过 DNS 直连指定 IP，但 servername/Host 仍是原主机名 → 证书照常按主机名校验，不降级
+    if (pinIp) {
+      opts.lookup = (hostname, o, cb) => {
+        const done = typeof o === 'function' ? o : cb;
+        const oo = (o && typeof o === 'object') ? o : {};
+        if (oo.all) return done(null, [{ address: pinIp, family: 4 }]);   // all:true 必须给数组
+        done(null, pinIp, 4);
+      };
+    }
+    let settled = false;
+    let killer = null;
+    const finish = (v) => { if (settled) return; settled = true; if (killer) clearTimeout(killer); resolve(v); };
+    const rq = https.request(opts, (r) => {
       const chunks = [];
       r.on('data', c => chunks.push(c));
       r.on('end', () => {
-        if (r.statusCode !== 200) return resolve(null);
-        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch { resolve(null); }
+        if (r.statusCode !== 200) return finish(null);
+        try { finish(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch { finish(null); }
       });
-      r.on('error', () => resolve(null));
+      r.on('error', () => finish(null));
     });
-    rq.on('error', () => resolve(null));
-    rq.on('timeout', () => { rq.destroy(); resolve(null); });
+    // 显式兜底计时器：`timeout` 选项在「DNS 解析 + TCP 建连」阶段并不保证按时触发
+    //（实测 connect 卡住时会拖到 12s），所以自己掐表，到点直接销毁请求
+    killer = setTimeout(() => { try { rq.destroy(); } catch {} finish(null); }, timeoutMs);
+    rq.on('error', () => finish(null));
+    rq.on('timeout', () => { rq.destroy(); finish(null); });
     rq.end();
   });
+}
+
+// 带「钉 IP 兜底」的 GET：先按 DNS 直连；失败则依次试固定 IP，并记住成功的那台
+// （下次直接用，省掉一轮超时）。成功过的 IP 失效时会被清掉重新探。
+async function httpsGetJsonWithFallback(url, timeoutMs = 6000) {
+  let host = '';
+  try { host = new URL(url).hostname; } catch { return null; }
+
+  const cached = weatherPinnedIp.get(host);
+  if (cached) {
+    const r = await httpsGetJson(url, timeoutMs, cached);
+    if (r) return r;
+    weatherPinnedIp.delete(host);
+    console.log(`[weather] ${host} 固定 IP ${cached} 失效，重新探测`);
+  }
+
+  const direct = await httpsGetJson(url, Math.min(timeoutMs, 4000));
+  if (direct) return direct;
+
+  // 直连不通才走固定 IP；记住成功的那台，之后每轮直接命中（省掉一次直连超时）
+  const pins = WEATHER_PIN_IPS.length ? WEATHER_PIN_IPS : (WEATHER_DEFAULT_PINS[host] || []);
+  for (const ip of pins) {
+    const r = await httpsGetJson(url, timeoutMs, ip);
+    if (r) {
+      weatherPinnedIp.set(host, ip);
+      console.log(`[weather] ${host} 直连失败，改用固定 IP ${ip}（后续复用）`);
+      return r;
+    }
+  }
+  return null;
 }
 
 async function fetchCityWeather(c) {
@@ -1846,7 +1908,11 @@ async function fetchCityWeather(c) {
     + '&current=pm2_5,us_aqi'
     + `&timezone=${encodeURIComponent(WEATHER_TZ)}`;
 
-  const [fc, aq] = await Promise.all([httpsGetJson(fUrl), httpsGetJson(aUrl)]);
+  // 两个请求都走「DNS 直连 → 钉 IP 兜底」：api.open-meteo.com 的 DNS 边缘在部分网络不可达
+  const [fc, aq] = await Promise.all([
+    httpsGetJsonWithFallback(fUrl),
+    httpsGetJsonWithFallback(aUrl),
+  ]);
   if (!fc || !fc.current || !fc.daily) return null;
 
   const cur = fc.current;
@@ -2507,6 +2573,10 @@ function reply(res, status, obj) {
 // 日期 / 月份切分统一按 UTC+8（和健康、对话时间线的显示口径一致）
 const AUDIT_DIR = path.join(__dirname, 'audit');
 const AUDIT_CATEGORIES = ['餐饮', '零食', '饮料', '医疗', '教育', '日用', '服饰', '娱乐', '交通', '购物', '其它杂项'];
+// 入账（收入）分类：和支出共用同一套存储/流水/筛选，只靠记录上的 type 区分
+const AUDIT_INCOME_CATEGORIES = ['工资', '兼职', '红包', '报销', '退款', '理财', '其它收入'];
+// 老记录没有 type 字段 → 一律当支出（向后兼容）
+const auditTypeOf = r => (r && r.type === 'income') ? 'income' : 'expense';
 const AUDIT_MAX_CENTS = 100 * 1000 * 1000;   // 单笔上限 100 万元
 const AUDIT_MAX_NOTE_LEN = 200;
 const AUDIT_TZ_OFFSET_MS = 8 * 3600 * 1000;
@@ -2618,6 +2688,7 @@ function auditPublic(r) {
     timestamp: r.timestamp,
     amount: centsToYuan(r.amount_cents),
     amount_cents: r.amount_cents,
+    type: auditTypeOf(r),
     category: r.category,
     note: r.note || '',
     created_at: r.created_at || null,
@@ -2642,9 +2713,11 @@ function auditBuildRecord(body) {
   }
   if (ts > Date.now() + 3600 * 1000) return { error: 'timestamp 不能是未来时间（超过 1 小时）' };
 
+  const type = b.type === 'income' ? 'income' : 'expense';
+  const cats = type === 'income' ? AUDIT_INCOME_CATEGORIES : AUDIT_CATEGORIES;
   const category = typeof b.category === 'string' ? b.category.trim() : '';
-  if (!AUDIT_CATEGORIES.includes(category)) {
-    return { error: `分类必须是：${AUDIT_CATEGORIES.join(' / ')}` };
+  if (!cats.includes(category)) {
+    return { error: `${type === 'income' ? '入账' : '支出'}分类必须是：${cats.join(' / ')}` };
   }
 
   let note = typeof b.note === 'string' ? b.note.trim() : '';
@@ -2655,6 +2728,7 @@ function auditBuildRecord(body) {
       id: crypto.randomBytes(9).toString('base64url'),
       timestamp: Math.round(ts),
       amount_cents: cents,
+      type,
       category,
       note,
       created_at: Date.now(),
@@ -2676,11 +2750,12 @@ function auditCollect(fromMs, toMs) {
   return rows;
 }
 
-// 分类聚合 + 合计（分）
-function auditAggregate(rows) {
+// 分类聚合 + 合计（分）；type 默认 'expense'，所以现有「支出」口径不受影响
+function auditAggregate(rows, type = 'expense') {
   const byCat = new Map();
+  const picked = rows.filter(r => auditTypeOf(r) === type);
   let total = 0;
-  for (const r of rows) {
+  for (const r of picked) {
     total += r.amount_cents;
     const cur = byCat.get(r.category) || { category: r.category, total_cents: 0, count: 0 };
     cur.total_cents += r.amount_cents;
@@ -2696,7 +2771,7 @@ function auditAggregate(rows) {
       count: x.count,
       pct: total > 0 ? Math.round((x.total_cents / total) * 1000) / 10 : 0,
     }));
-  return { total_cents: total, total: centsToYuan(total), count: rows.length, by_category };
+  return { total_cents: total, total: centsToYuan(total), count: picked.length, by_category };
 }
 
 // 今日 / 最近 7 天 → 给 Daemon 的一行摘要（context-export 与 System Prompt 共用）
@@ -2707,30 +2782,51 @@ function buildAuditContext() {
   const todayRows = auditCollect(todayStart, now);
   const weekRows = auditCollect(weekStart, now);
 
-  const todayTotal = todayRows.reduce((s, r) => s + r.amount_cents, 0);
-  const weekTotal = weekRows.reduce((s, r) => s + r.amount_cents, 0);
+  const sumOf = (rows, type) => rows.reduce((s, r) => s + (auditTypeOf(r) === type ? r.amount_cents : 0), 0);
+  const todayTotal = sumOf(todayRows, 'expense');
+  const weekTotal = sumOf(weekRows, 'expense');
+  const todayIn = sumOf(todayRows, 'income');
+  const weekIn = sumOf(weekRows, 'income');
 
   // 今日明细：HH:MM 分类-备注 ¥金额（每笔带时刻和金额），列当天全部（按时间倒序，最近的在前）。
   // 只留一个 800 字的安全阀：个人记账一天很少超过 20 笔，真刷屏时截断免得把 prompt 撑爆
-  let detail = '';
-  if (todayRows.length) {
-    const parts = todayRows.slice()
+  const detailOf = (rows, type) => {
+    const picked = rows.filter(r => auditTypeOf(r) === type);
+    if (!picked.length) return '';
+    let joined = picked.slice()
       .sort((a, b) => b.timestamp - a.timestamp)
       .map(r => {
         const label = [r.category, r.note].filter(Boolean).join('-');
         return `${auditClockOf(r.timestamp)} ${label} ¥${auditFmtYuan(r.amount_cents)}`;
-      });
-    let joined = parts.join('；');
+      })
+      .join('；');
     if (joined.length > 800) joined = joined.slice(0, 800) + '…';
-    detail = ` (${joined})`;
-  }
+    return ` (${joined})`;
+  };
+  const detail = detailOf(todayRows, 'expense');
+  const incomeDetail = detailOf(todayRows, 'income');
 
-  const line = `[近期财务流水：今日已支出 ${auditFmtYuan(todayTotal)} 元${detail}；本周累计支出 ${auditFmtYuan(weekTotal)} 元]`;
+  // 没有入账时保持原文案不变（老行为零变化）；有入账才追加那两段
+  const incomePart = todayIn > 0
+    ? `；今日已入账 ${auditFmtYuan(todayIn)} 元${incomeDetail}`
+    : '';
+  const weekPart = weekIn > 0
+    ? `；本周累计：支出 ${auditFmtYuan(weekTotal)} 元，入账 ${auditFmtYuan(weekIn)} 元`
+    : `；本周累计支出 ${auditFmtYuan(weekTotal)} 元`;
+  const line = `[近期财务流水：今日已支出 ${auditFmtYuan(todayTotal)} 元${detail}${incomePart}${weekPart}]`;
   return {
     line,
     empty: weekRows.length === 0,
-    today: { date: auditDayKeyOf(now), total_cents: todayTotal, total: centsToYuan(todayTotal), count: todayRows.length },
-    week: { from: auditDayKeyOf(weekStart), to: auditDayKeyOf(now), total_cents: weekTotal, total: centsToYuan(weekTotal), count: weekRows.length },
+    today: {
+      date: auditDayKeyOf(now),
+      total_cents: todayTotal, total: centsToYuan(todayTotal), count: todayRows.filter(r => auditTypeOf(r) === 'expense').length,
+      income_cents: todayIn, income: centsToYuan(todayIn),
+    },
+    week: {
+      from: auditDayKeyOf(weekStart), to: auditDayKeyOf(now),
+      total_cents: weekTotal, total: centsToYuan(weekTotal), count: weekRows.filter(r => auditTypeOf(r) === 'expense').length,
+      income_cents: weekIn, income: centsToYuan(weekIn),
+    },
   };
 }
 
@@ -5682,11 +5778,15 @@ async function handleAuditRoutes(req, res) {
     const offset = Math.max(0, parseInt(q.get('offset') || '0', 10) || 0);
     const month = (q.get('month') || '').trim();
     const category = (q.get('category') || '').trim();
+    const type = (q.get('type') || '').trim();          // expense | income | 空=都要
     if (month && !/^\d{4}-\d{2}$/.test(month)) {
       return reply(res, 400, { error: 'month 必须形如 YYYY-MM' });
     }
-    if (category && !AUDIT_CATEGORIES.includes(category)) {
+    if (category && !AUDIT_CATEGORIES.includes(category) && !AUDIT_INCOME_CATEGORIES.includes(category)) {
       return reply(res, 400, { error: `未知分类：${category}` });
+    }
+    if (type && type !== 'expense' && type !== 'income') {
+      return reply(res, 400, { error: 'type 只能是 expense / income' });
     }
 
     const months = auditListMonths();
@@ -5694,15 +5794,23 @@ async function handleAuditRoutes(req, res) {
     let rows = [];
     for (const mk of scanMonths) rows.push(...auditReadMonth(mk));
     if (category) rows = rows.filter(r => r.category === category);
+    if (type) rows = rows.filter(r => auditTypeOf(r) === type);
     rows.sort((a, b) => (b.timestamp - a.timestamp) || ((b.created_at || 0) - (a.created_at || 0)));
 
-    const totalCents = rows.reduce((s, r) => s + r.amount_cents, 0);
+    // 支出 / 入账分开合计（老数据全是支出，所以 total_amount_cents 的含义不变）
+    let expenseCents = 0, incomeCents = 0;
+    for (const r of rows) {
+      if (auditTypeOf(r) === 'income') incomeCents += r.amount_cents;
+      else expenseCents += r.amount_cents;
+    }
     const page = rows.slice(offset, offset + limit).map(auditPublic);
     return reply(res, 200, {
       ok: true,
       total: rows.length,
-      total_amount: centsToYuan(totalCents),
-      total_amount_cents: totalCents,
+      total_amount: centsToYuan(expenseCents),
+      total_amount_cents: expenseCents,
+      income_amount: centsToYuan(incomeCents),
+      income_amount_cents: incomeCents,
       limit, offset,
       items: page,
       months,
@@ -5752,11 +5860,13 @@ async function handleAuditRoutes(req, res) {
     }
 
     const rows = auditCollect(fromMs, toMs);
-    const agg = auditAggregate(rows);
+    const agg = auditAggregate(rows);              // 支出（图表/卡片口径，保持不变）
+    const incAgg = auditAggregate(rows, 'income'); // 入账
 
-    // 每日聚合（按 UTC+8 切日）—— 柱状图用
+    // 每日聚合（按 UTC+8 切日）—— 柱状图用；只算支出，入账不混进「支出趋势」
     const dayMap = new Map();
     for (const r of rows) {
+      if (auditTypeOf(r) === 'income') continue;
       const dk = auditDayKeyOf(r.timestamp);
       const cur = dayMap.get(dk) || { date: dk, total_cents: 0, count: 0 };
       cur.total_cents += r.amount_cents;
@@ -5769,6 +5879,7 @@ async function handleAuditRoutes(req, res) {
     // 每月聚合 —— 「全部月份」视图的柱状图用
     const monthMap = new Map();
     for (const r of rows) {
+      if (auditTypeOf(r) === 'income') continue;
       const mk = auditMonthKeyOf(r.timestamp);
       const cur = monthMap.get(mk) || { month: mk, total_cents: 0, count: 0 };
       cur.total_cents += r.amount_cents;
@@ -5780,12 +5891,17 @@ async function handleAuditRoutes(req, res) {
 
     // 当前自然月（摘要卡片固定看本月，与筛选无关）
     const cmKey = auditMonthKeyOf(now);
-    const cmAgg = auditAggregate(auditCollect(auditMonthStartMs(cmKey), now));
+    const cmRows = auditCollect(auditMonthStartMs(cmKey), now);
+    const cmAgg = auditAggregate(cmRows);
+    const cmInc = auditAggregate(cmRows, 'income');
 
     // 今日（同样与筛选无关）
     const todayStart = Date.parse(`${auditDayKeyOf(now)}T00:00:00+08:00`);
     const todayRows = auditCollect(todayStart, now);
-    const todayCents = todayRows.reduce((s, r) => s + r.amount_cents, 0);
+    const todayExp = todayRows.filter(r => auditTypeOf(r) === 'expense');
+    const todayInc = todayRows.filter(r => auditTypeOf(r) === 'income');
+    const todayCents = todayExp.reduce((s, r) => s + r.amount_cents, 0);
+    const todayIncomeCents = todayInc.reduce((s, r) => s + r.amount_cents, 0);
 
     return reply(res, 200, {
       ok: true,
@@ -5795,11 +5911,20 @@ async function handleAuditRoutes(req, res) {
       total: agg.total,
       count: agg.count,
       avg: agg.count ? centsToYuan(agg.total_cents / agg.count) : 0,
+      income_cents: incAgg.total_cents,
+      income: incAgg.total,
+      income_count: incAgg.count,
+      net_cents: incAgg.total_cents - agg.total_cents,
+      net: centsToYuan(incAgg.total_cents - agg.total_cents),
+      income_by_category: incAgg.by_category,
       today: {
         date: auditDayKeyOf(now),
         total_cents: todayCents,
         total: centsToYuan(todayCents),
-        count: todayRows.length,
+        count: todayExp.length,
+        income_cents: todayIncomeCents,
+        income: centsToYuan(todayIncomeCents),
+        income_count: todayInc.length,
       },
       top_category: agg.by_category[0] || null,
       by_category: agg.by_category,
@@ -5811,13 +5936,22 @@ async function handleAuditRoutes(req, res) {
         total: cmAgg.total,
         count: cmAgg.count,
         avg: cmAgg.count ? centsToYuan(cmAgg.total_cents / cmAgg.count) : 0,
+        income_cents: cmInc.total_cents,
+        income: cmInc.total,
+        income_count: cmInc.count,
+        net_cents: cmInc.total_cents - cmAgg.total_cents,
+        net: centsToYuan(cmInc.total_cents - cmAgg.total_cents),
         top_category: cmAgg.by_category[0] || null,
         by_category: cmAgg.by_category,
+        income_by_category: cmInc.by_category,
         today: {
           date: auditDayKeyOf(now),
           total_cents: todayCents,
           total: centsToYuan(todayCents),
-          count: todayRows.length,
+          count: todayExp.length,
+          income_cents: todayIncomeCents,
+          income: centsToYuan(todayIncomeCents),
+          income_count: todayInc.length,
         },
       },
     });
