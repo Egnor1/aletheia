@@ -4331,8 +4331,8 @@ function handleRequest(req, res) {
         sent_msgs: cacheMode ? reqBody.contents.length : trimmedContents.length,
       });
 
-      // systemInstruction 终稿已在上面算好（finalSysText）
-      if (finalSysText) {
+      // systemInstruction 由 applyFullBody() / 缓存分支决定；缓存模式下**绝不能**再带（会 400）
+      if (!cacheMode && finalSysText) {
         reqBody.systemInstruction = { parts: [{ text: finalSysText }] };
       }
 
@@ -4445,7 +4445,7 @@ function handleRequest(req, res) {
           }
 
           // 内建搜索不可用（key 没额度 / 该模型不支持 grounding）时降级成 web_search 函数工具
-          if (geminiRes.statusCode !== 200 && geminiNativeSearch
+          if (geminiRes.statusCode !== 200 && geminiNativeSearch && !cacheMode
               && /grounding|google search|google_search|not supported|tool/i.test(preErrBody)) {
             console.warn('[gemini] 内建搜索被拒，降级为 DeepSeek 搜索函数工具:', preErrBody.slice(0, 200));
             reqBody.tools = [...mergedTools, WEB_SEARCH_TOOL];
