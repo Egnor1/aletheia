@@ -2142,6 +2142,7 @@
     <select class="rs-select" id="rsModel">
       <optgroup label="Gemini 4">
         <option value="gemini-4-carbon">Gemini 4 Carbon · $2/$10（推理旗舰）</option>
+        <option value="gemini-4-hydrogen">Gemini 4 Hydrogen · $1.50/$7.50（极速·Agent）</option>
         <option value="gemini-4-argon">Gemini 4 Argon · $2/$10</option>
       </optgroup>
       <optgroup label="Gemini 3.8">
@@ -2353,6 +2354,7 @@ function shortModelName(m) {
   const map = {
     // 2026-10-14 按 Google 官方 pricing/deprecations 页核对过
     'gemini-4-carbon': '4 Carbon',
+    'gemini-4-hydrogen': '4 Hydrogen',
     'gemini-4-argon': '4 Argon',
     'gemini-3.8-flash': '3.8 Flash',
     'gemini-3.6-flash': '3.6 Flash',
@@ -3834,6 +3836,7 @@ function buildSearchSourcesHtml(sources) {
 // 2026-10-14 按官方 pricing 页核对；带「促销」的是当前价，注释里写了到期后的价
 const MODEL_PRICING = {
   'gemini-4-carbon':               [2.00, 10.00],            // 促销至 2026-11-30，之后 4.00 / 20.00；无免费额度
+  'gemini-4-hydrogen':             [1.50,  7.50],            // 1M 上下文内不涨价；快速 agent 档
   'gemini-4-argon':                [2.00, 10.00],            // 促销至 2026-11-30，之后 4.00 / 20.00
   'gemini-3.8-flash':              [0.75,  3.75],            // 促销至 2026-12-31，之后 1.50 / 7.50
   'gemini-3.6-flash':              [0.75,  3.75],            // 同上（促销期内同价）

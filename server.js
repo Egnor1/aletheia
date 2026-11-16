@@ -34,6 +34,54 @@ const PORT = 3000;
 const HTTPS_PORT = 3443;
 const GEMINI_HOST = 'generativelanguage.googleapis.com';
 
+// ===== 用量审计（对账用）=====
+// 每次真实 API 调用落一行到 usage/usage-YYYY-MM-DD.jsonl，字段：
+//   ts / provider / model / kind / convId / in / out / think / cached / search / ok / ms
+// Google 侧只给总账，这边给「谁花在哪」。关掉：USAGE_LOG=off
+const USAGE_DIR = path.join(__dirname, 'usage');
+const USAGE_LOG_ON = String(process.env.USAGE_LOG || 'on').toLowerCase() !== 'off';
+// USD / 1M tokens：[输入, 输出, 图片输出]（图片模型才有第三项）
+const SERVER_PRICE = {
+  'gemini-4-carbon': [2.00, 10.00],
+  'gemini-4-argon': [2.00, 10.00],
+  'gemini-4-hydrogen': [1.50, 7.50],
+  'gemini-3.8-flash': [0.75, 3.75],
+  'gemini-3.6-flash': [0.75, 3.75],
+  'gemini-3.5-flash-lite': [0.30, 2.50],
+  'gemini-3.1-pro-preview': [2.00, 12.00],
+  'gemini-3.1-flash-lite': [0.25, 1.50],
+  'gemini-2.5-pro': [1.25, 10.00],
+  'gemini-2.5-flash': [0.30, 2.50],
+  'gemini-nano-banana-2.1': [1.50, 7.50, 30.00],
+  'gemini-3-pro-image': [2.00, 12.00, 120.00],
+  'gemini-3.1-flash-image': [0.50, 3.00, 60.00],
+  'gemini-3.1-flash-lite-image': [0.25, 1.50, 30.00],
+  'gemini-2.5-flash-image': [0.30, 2.50, 39.00],
+  'gemini-3.7-flash': [0.75, 3.75],
+  'gemini-3.5-flash': [0.75, 3.75],
+  'gemini-3.1-flash-lite-preview': [0.25, 1.50],
+  'gemini-3-flash-preview': [0.75, 3.75],
+  'gemini-3-pro-image-preview': [2.00, 12.00, 120.00],
+  'gemini-3.1-flash-image-preview': [0.50, 3.00, 60.00],
+};
+function logUsage(rec) {
+  if (!USAGE_LOG_ON) return;
+  try {
+    if (!fs.existsSync(USAGE_DIR)) fs.mkdirSync(USAGE_DIR, { recursive: true });
+    const day = new Date().toISOString().slice(0, 10);
+    fs.appendFileSync(path.join(USAGE_DIR, `usage-${day}.jsonl`), JSON.stringify({ ts: Date.now(), ...rec }) + '\n');
+  } catch (e) { /* 审计失败不影响主流程 */ }
+}
+// 一份用量记录 → 美元估算（缓存命中部分按 25% 计价）
+function usageCostUsd(rec) {
+  const p = SERVER_PRICE[rec.model];
+  if (!p) return 0;
+  const cached = Math.min(rec.cached || 0, rec.in || 0);
+  const fresh = Math.max(0, (rec.in || 0) - cached);
+  const out = (rec.out || 0) + (rec.think || 0);
+  return (fresh / 1e6) * p[0] + (cached / 1e6) * p[0] * 0.25 + (out / 1e6) * p[1];
+}
+
 // ===== 对话日志 =====
 const CHAT_LOG_DIR = path.join(__dirname, 'logs');
 function logChat(role, text, thought) {
@@ -1319,8 +1367,47 @@ function geminiHttps(opts) {
   });
 }
 
-async function startGeminiUpload(apiKey, mimeType, size, displayName) {
+// ===== Gemini 显式上下文缓存（cachedContents）=====
+// 为什么需要：按 6~7 万 token 的上下文聊天时，每轮都把整段历史按输入价重算；
+// 平台自带的隐式缓存 TTL 只有几分钟（实测 cachedContentTokenCount 基本为 0），聊慢一点就全价。
+// 显式缓存把「不变的历史前缀」存一份（TTL 可配，默认 1 小时），命中时输入按 25% 计价，
+// 存储另算（1M token·小时约 $1；6 万前缀 ≈ $0.06/小时），聊天密集时净省 60%+。
+// 只缓存 contents（历史），不缓存 systemInstruction / tools —— 那两块每轮都在变
+//（健康、天气、记忆注入），塞进缓存反而保证每次都 miss。
+// 开关：GEMINI_CACHE=off 关掉；GEMINI_CACHE_TTL / GEMINI_CACHE_MIN_TOKENS / GEMINI_CACHE_TAIL_MSGS 可调。
+const GEMINI_CACHE_ON = String(process.env.GEMINI_CACHE || 'on').toLowerCase() !== 'off';
+const GEMINI_CACHE_TTL_S = Math.max(300, Number(process.env.GEMINI_CACHE_TTL || 3600));
+const GEMINI_CACHE_MIN_TOKENS = Number(process.env.GEMINI_CACHE_MIN_TOKENS || 15000);
+const GEMINI_CACHE_TAIL_MSGS = Math.max(2, Number(process.env.GEMINI_CACHE_TAIL_MSGS || 8));
+const GEMINI_CACHE_MAX_TAIL = Math.max(4, Number(process.env.GEMINI_CACHE_MAX_TAIL || 16));  // 尾巴涨到这么多条就重建
+const geminiCaches = new Map();   // convId → {name, model, keyHash, nMsgs, tokens, exp, hash}
+
+function geminiCacheSupported(model, nativeSearch) {
+  if (!GEMINI_CACHE_ON || !model) return false;
+  if (nativeSearch) return false;                              // 内建 grounding 与 cachedContents 不混用
+  if (!/^gemini-(2\.5|3|4)/.test(model)) return false;
+  if (/image|nano-banana/.test(model)) return false;           // 图像模型不走缓存
+  return true;
+}
+function sha12(s) { return crypto.createHash('sha256').update(s).digest('hex').slice(0, 16); }
+function keyHashOf(apiKey) { return sha12(String(apiKey || '')); }
+function contentsHash(contents) {
+  try { return sha12(JSON.stringify(contents || [])); } catch { return ''; }
+}
+async function createGeminiCache(apiKey, model, contents) {
   const r = await geminiHttps({
+    url: `https://generativelanguage.googleapis.com/v1beta/cachedContents?key=${encodeURIComponent(apiKey)}`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: `models/${model}`, contents, ttl: `${GEMINI_CACHE_TTL_S}s` }),
+    timeout: 90000,
+  });
+  if (r.status !== 200) throw new Error(`cachedContents ${r.status}: ${String(r.body || '').slice(0, 200)}`);
+  const d = JSON.parse(r.body);
+  return { name: d.name, tokens: Number((d.usageMetadata && d.usageMetadata.totalTokenCount) || 0), expireTime: d.expireTime || '' };
+}
+
+async function startGeminiUpload(apiKey, mimeType, size, displayName) {  const r = await geminiHttps({
     url: `${GEMINI_FILES_START_URL}?key=${encodeURIComponent(apiKey)}`,
     method: 'POST',
     headers: {
@@ -3334,6 +3421,11 @@ function handleRequest(req, res) {
     return handleAuditRoutes(req, res);
   }
 
+  // --- 用量审计：/api/usage/summary?days=7 ---
+  if ((req.url || '').split('?')[0].startsWith('/api/usage/')) {
+    return handleUsageRoutes(req, res);
+  }
+
   // --- Health DB upload ---
   if (req.method === 'POST' && req.url === '/api/upload-health-db') {
     const chunks = [];
@@ -4071,6 +4163,14 @@ function handleRequest(req, res) {
             if (usageMetadata) doneData.usageMetadata = usageMetadata;
             if (savedMemories.length > 0) doneData.savedMemories = savedMemories;
             if (searchSources.length > 0) doneData.searchSources = searchSources;
+            logUsage({
+              provider: 'deepseek', model, kind: 'chat', convId: convId || '', ok: true,
+              in: usageMetadata?.promptTokenCount || 0,
+              out: usageMetadata?.candidatesTokenCount || 0,
+              think: usageMetadata?.thoughtsTokenCount || 0,
+              cached: usageMetadata?.cachedContentTokenCount || 0,
+              search: searchSources.length,
+            });
             sseSend(doneData);
             res.end();
 
@@ -4100,6 +4200,46 @@ function handleRequest(req, res) {
       // ===== Gemini 分支 =====
       const streamPath = `/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
       const reqBody = { contents: trimmedContents };
+
+      // 上下文缓存：命中就把历史前缀换成 cachedContent，本次只发尾巴
+      let geminiCacheUsed = null;
+      if (geminiCacheSupported(model, geminiNativeSearch)) {
+        const cKey = convId || '__default__';
+        const rec = geminiCaches.get(cKey);
+        const newerThanRec = rec && rec.nMsgs < trimmedContents.length;
+        if (rec && newerThanRec && rec.model === model && rec.exp > Date.now() + 60000
+            && rec.keyHash === keyHashOf(apiKey)
+            && contentsHash(trimmedContents.slice(0, rec.nMsgs)) === rec.hash) {
+          reqBody.cachedContent = rec.name;
+          reqBody.contents = trimmedContents.slice(rec.nMsgs);
+          geminiCacheUsed = rec;
+          console.log(`[cache] 命中 conv=${cKey} 前缀 ${rec.nMsgs} 条 / ${rec.tokens} tokens，本次只发 ${trimmedContents.length - rec.nMsgs} 条`);
+        }
+        // 没命中（或尾巴太长 / 快过期）就在后台重建，本次请求仍走全量
+        const nMsgs = trimmedContents.length - GEMINI_CACHE_TAIL_MSGS;
+        const needRebuild = !geminiCacheUsed && nMsgs > 0
+          && (!rec || rec.model !== model || rec.exp - Date.now() < 600000
+              || trimmedContents.length - rec.nMsgs > GEMINI_CACHE_MAX_TAIL
+              || rec.keyHash !== keyHashOf(apiKey));
+        if (needRebuild) {
+          const prefix = trimmedContents.slice(0, nMsgs);
+          const est = estimateTokens(prefix);
+          if (est >= GEMINI_CACHE_MIN_TOKENS) {
+            const h = contentsHash(prefix);
+            // 前缀没变就别重复建（每建一次都是新的存储账单）
+            if (!rec || rec.hash !== h) {
+              const capturedKey = keyHashOf(apiKey);
+              createGeminiCache(apiKey, model, prefix).then(({ name, tokens }) => {
+                geminiCaches.set(cKey, {
+                  name, model, keyHash: capturedKey, nMsgs, tokens, hash: h,
+                  exp: Date.now() + GEMINI_CACHE_TTL_S * 1000,
+                });
+                console.log(`[cache] 已建立 conv=${cKey} 前缀 ${nMsgs} 条 / ≈${est} tokens (调用侧报 ${tokens})，TTL ${GEMINI_CACHE_TTL_S}s`);
+              }).catch(e => console.warn('[cache] 建立失败（不影响本次请求）:', e.message));
+            }
+          }
+        }
+      }
 
       // systemInstruction 终稿已在上面算好（finalSysText）
       if (finalSysText) {
@@ -4196,6 +4336,16 @@ function handleRequest(req, res) {
 
         if (geminiRes.statusCode !== 200) {
           preErrBody = await collectStreamText(geminiRes);
+
+          // 缓存名失效（TTL 到期 / 被删 / 换 key）→ 丢掉缓存整段重发，别让用户看到报错
+          if (reqBody.cachedContent && /cachedContent|cached_content|cache/i.test(preErrBody)) {
+            console.warn('[cache] 缓存不可用，去掉 cachedContent 重试:', preErrBody.slice(0, 200));
+            geminiCaches.delete(convId || '__default__');
+            delete reqBody.cachedContent;
+            reqBody.contents = trimmedContents;
+            geminiRes = await callGeminiRaw(streamPath, reqBody);
+            preErrBody = geminiRes.statusCode !== 200 ? await collectStreamText(geminiRes) : '';
+          }
 
           // 附件失效（403 PERMISSION_DENIED / 过期）→ 登记 + 剔除后重试一次
           if (MEDIA_DEAD_RE.test(preErrBody)) {
@@ -4592,6 +4742,14 @@ function handleRequest(req, res) {
           if (usageMetadata) doneData.usageMetadata = usageMetadata;
           if (searchSources.length > 0) doneData.searchSources = searchSources;
           if (savedMemories.length > 0) doneData.savedMemories = savedMemories;
+          logUsage({
+            provider: 'gemini', model, kind: 'chat', convId: convId || '', ok: true,
+            in: usageMetadata?.promptTokenCount || 0,
+            out: usageMetadata?.candidatesTokenCount || 0,
+            think: usageMetadata?.thoughtsTokenCount || 0,
+            cached: usageMetadata?.cachedContentTokenCount || 0,
+            search: (geminiNativeSearch ? 1 : 0) + searchSources.length,
+          });
           sseSend(doneData);
           res.end();
 
@@ -5547,6 +5705,12 @@ async function proactiveDecide(body = {}) {
 
   const parsed = parseGateJSON(raw);
   console.log(`[proactive] 阶段一 provider=${provider} status=${status} ${Date.now() - t0}ms should_act=${parsed ? parsed.should_act : 'parse_fail'} usage=${JSON.stringify(usage)}`);
+  logUsage({
+    provider: provider || 'deepseek', model: (provider === 'gemini' ? (process.env.PROACTIVE_GATE_MODEL || 'gemini-2.5-flash') : 'deepseek-chat'),
+    kind: 'proactive_gate1', convId: '', ok: !!(usage && usage.promptTokenCount),
+    in: usage?.promptTokenCount || 0, out: usage?.candidatesTokenCount || 0,
+    think: usage?.thoughtsTokenCount || 0, cached: usage?.cachedContentTokenCount || 0, search: 0,
+  });
   if (!parsed) return { ok: false, error: `gate failed (${provider} status=${status})`, raw: String(raw).slice(0, 300), usage, status, provider };
   return { ok: true, decision: parsed, usage, snapshot: snap, provider, status };
 }
@@ -5676,6 +5840,12 @@ async function proactiveGenerate(body = {}) {
   }
   text = String(text).replace(/\[NEXT_TRIGGER:[^\]]*\]/g, '').trim();
   console.log(`[proactive] 阶段二 model=${model} ${Date.now() - t0}ms chars=${text.length} usage=${JSON.stringify(usage)}${fallback ? ' (' + fallback + ')' : ''}`);
+  logUsage({
+    provider: /^deepseek/.test(model || '') ? 'deepseek' : 'gemini',
+    model: model || 'unknown', kind: 'proactive_stage2', convId: convId || '', ok: true,
+    in: usage?.promptTokenCount || 0, out: usage?.candidatesTokenCount || 0,
+    think: usage?.thoughtsTokenCount || 0, cached: usage?.cachedContentTokenCount || 0, search: 0,
+  });
   if (!text) return { ok: false, error: 'empty generation', usage };
   return { ok: true, text, model, convId, usage, fallback };
 }
@@ -5745,6 +5915,68 @@ function auditParseRangeParam(v, isEnd = false) {
   }
   const n = parseClientTimestamp(v);
   return Number.isFinite(n) ? n : null;
+}
+
+async function handleUsageRoutes(req, res) {
+  const q = new URL(req.url, 'http://x').searchParams;
+  const days = Math.max(1, Math.min(90, Number(q.get('days')) || 7));
+  const send = (code, obj) => {
+    const body = JSON.stringify(obj);
+    res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(body);
+  };
+  try {
+    const dayKeys = [];
+    const now = new Date();
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 86400000);
+      dayKeys.push(d.toISOString().slice(0, 10));
+    }
+    const byDay = new Map();
+    const byModel = new Map();
+    const total = { calls: 0, in: 0, out: 0, think: 0, cached: 0, search: 0, cost_usd: 0, fail: 0 };
+    for (const day of dayKeys) {
+      const f = path.join(USAGE_DIR, `usage-${day}.jsonl`);
+      if (!fs.existsSync(f)) continue;
+      const agg = { date: day, calls: 0, in: 0, out: 0, think: 0, cached: 0, search: 0, cost_usd: 0, fail: 0, models: {} };
+      for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        let r; try { r = JSON.parse(line); } catch { continue; }
+        const cost = usageCostUsd(r);
+        agg.calls++; agg.in += r.in || 0; agg.out += r.out || 0; agg.think += r.think || 0;
+        agg.cached += r.cached || 0; agg.search += r.search || 0; agg.cost_usd += cost;
+        if (r.ok === false) agg.fail++;
+        total.calls++; total.in += r.in || 0; total.out += r.out || 0; total.think += r.think || 0;
+        total.cached += r.cached || 0; total.search += r.search || 0; total.cost_usd += cost;
+        if (r.ok === false) total.fail++;
+        const mk = `${r.provider || '?'}/${r.model || '?'}`;
+        const m = agg.models[mk] || (agg.models[mk] = { calls: 0, in: 0, out: 0, think: 0, cost_usd: 0 });
+        m.calls++; m.in += r.in || 0; m.out += r.out || 0; m.think += r.think || 0; m.cost_usd += cost;
+        const gm = byModel.get(mk) || { provider: r.provider, model: r.model, calls: 0, in: 0, out: 0, think: 0, cached: 0, cost_usd: 0 };
+        gm.calls++; gm.in += r.in || 0; gm.out += r.out || 0; gm.think += r.think || 0; gm.cached += r.cached || 0; gm.cost_usd += cost;
+        byModel.set(mk, gm);
+      }
+      for (const m of Object.values(agg.models)) m.cost_usd = Math.round(m.cost_usd * 1e4) / 1e4;
+      agg.cost_usd = Math.round(agg.cost_usd * 1e4) / 1e4;
+      byDay.set(day, agg);
+    }
+    const round = (n) => Math.round(n * 1e4) / 1e4;
+    total.cost_usd = round(total.cost_usd);
+    const models = [...byModel.values()].map(m => ({ ...m, cost_usd: round(m.cost_usd) }))
+      .sort((a, b) => b.cost_usd - a.cost_usd);
+    return send(200, {
+      ok: true,
+      days,
+      from: dayKeys[0], to: dayKeys[dayKeys.length - 1],
+      total,
+      by_day: [...byDay.values()],
+      by_model: models,
+      log_dir: USAGE_DIR,
+      enabled: USAGE_LOG_ON,
+    });
+  } catch (e) {
+    return send(500, { ok: false, error: e.message });
+  }
 }
 
 async function handleAuditRoutes(req, res) {

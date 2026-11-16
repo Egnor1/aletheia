@@ -25,9 +25,10 @@ chroma_backup.json
 core_candidates.json
 core_shortlist.json
 fix_pronouns_log.jsonl
-# 健康 / 体重 / 屏幕时间 / 记账
+# 健康 / 体重 / 屏幕时间 / 记账 / API 用量审计
 health/
 audit/
+usage/
 *.db
 Gadgetbridge*
 # 私密导出 / 截图 / 来源不明的大文件
