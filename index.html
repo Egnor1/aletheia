@@ -281,6 +281,33 @@
   }
   .mv-close:hover { color: #fff; }
 
+  /* ===== Monitor（API 用量 / 上下文监控）===== */
+  .mon-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 8px; margin-bottom: 4px; }
+  .mon-stat { background: #232323; border: 1px solid #333; border-radius: 8px; padding: 10px 12px; }
+  .mon-stat-label { font-size: 11px; color: #888; margin-bottom: 4px; white-space: nowrap; }
+  .mon-stat-value { font-size: 18px; color: #f0f0f0; font-family: 'Fira Code', monospace; line-height: 1.2; }
+  .mon-stat-sub { font-size: 11px; color: #777; margin-top: 3px; }
+  .mon-sec { font-size: 12px; color: #999; margin: 16px 0 6px; display: flex; justify-content: space-between; align-items: baseline; }
+  .mon-sec small { color: #666; font-size: 11px; }
+  .mon-table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: 'Fira Code', monospace; }
+  .mon-table th { color: #777; font-weight: normal; text-align: right; padding: 4px 6px; border-bottom: 1px solid #2f2f2f; white-space: nowrap; }
+  .mon-table th:first-child, .mon-table td:first-child { text-align: left; }
+  .mon-table td { padding: 4px 6px; text-align: right; color: #bbb; border-bottom: 1px solid #262626; white-space: nowrap; }
+  .mon-table tr:last-child td { border-bottom: none; }
+  .mon-table td.hit { color: #6fcf8f; }
+  .mon-table td.muted { color: #666; }
+  .mon-card { background: #232323; border: 1px solid #333; border-radius: 8px; padding: 10px 12px; }
+  .mon-bar { height: 6px; border-radius: 3px; background: #2a2a2a; overflow: hidden; display: flex; margin: 6px 0 4px; }
+  .mon-bar > i { display: block; height: 100%; }
+  .mon-kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 11px; }
+  .mon-kv > b { color: #888; font-weight: normal; white-space: nowrap; }
+  .mon-kv > span { color: #ccc; font-family: 'Fira Code', monospace; text-align: right; }
+  .mon-chip { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px; border: 1px solid #3a3a3a; color: #999; margin-left: 6px; vertical-align: middle; }
+  .mon-chip.on { border-color: #3d7a55; color: #6fcf8f; }
+  .mon-chip.warn { border-color: #7a6a3d; color: #d8c37a; }
+  .mon-empty { color: #666; font-size: 12px; padding: 6px 0; }
+  .mon-note { color: #666; font-size: 11px; margin-top: 10px; line-height: 1.6; }
+
   /* ===== D.O. Dashboard ===== */
   .do-body {
     flex: 1; overflow-y: auto; padding: 20px 24px;
@@ -1797,6 +1824,10 @@
       <span class="pg-icon">&#128176;</span>
       Audit
     </div>
+    <div class="pg-toggle" onclick="openMonitor()">
+      <span class="pg-icon">&#128225;</span>
+      Monitor
+    </div>
   </div>
 
   <div class="sidebar-bottom" id="sidebarBottom">
@@ -2035,6 +2066,21 @@
         <div class="audit-empty">加载中...</div>
       </div>
       <button class="audit-more" id="auditMore" style="display:none" onclick="auditLoadMore()">加载更多</button>
+    </div>
+  </div>
+</div>
+
+<!-- Monitor（API 用量 + 上下文监控）Modal -->
+<div class="mv-overlay" id="monOverlay" onclick="closeMonitor(event)">
+  <div class="mv-modal" onclick="event.stopPropagation()">
+    <div class="mv-header">
+      <h2>Monitor</h2>
+      <div class="mv-count" id="monStatus">用量 / 上下文</div>
+      <button class="do-refresh" onclick="monRefresh(true)">刷新</button>
+      <button class="mv-close" onclick="closeMonitor()">&times;</button>
+    </div>
+    <div class="audit-body" id="monBody">
+      <div class="mon-empty">加载中...</div>
     </div>
   </div>
 </div>
@@ -6840,6 +6886,200 @@ function closeAudit(e) {
   if (e && e.target && e.target.closest && e.target.closest('.mv-modal')) return;
   document.getElementById('auditOverlay').classList.remove('open');
   auditDeletePending = null;
+}
+
+// ===== Monitor（API 用量 + 上下文监控）=====
+// 数据来源：/api/usage/summary（服务端落盘的每笔调用）、/api/usage/recent（明细）、
+// /api/monitor/context（最近一次请求的输入构成快照，内存里，不花钱）。
+let monBusy = false;
+
+function openMonitor() {
+  document.getElementById('monOverlay').classList.add('open');
+  monRefresh();
+}
+function closeMonitor(e) {
+  if (e && e.target && e.target.id !== 'monOverlay') return;
+  document.getElementById('monOverlay').classList.remove('open');
+}
+function monTok(n) {
+  n = Number(n) || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+function monUsd(v) {
+  v = Number(v) || 0;
+  return '$' + (v >= 10 ? v.toFixed(1) : v >= 1 ? v.toFixed(2) : v.toFixed(3));
+}
+// 与服务端 usageCostUsd 同口径：缓存命中部分按输入价 25%
+function monCost(r) {
+  const p = MODEL_PRICING[r.model];
+  if (!p) return 0;
+  const cached = Math.min(Number(r.cached) || 0, Number(r.in) || 0);
+  const fresh = Math.max(0, (Number(r.in) || 0) - cached);
+  return (fresh / 1e6) * p[0] + (cached / 1e6) * p[0] * 0.25 + (((Number(r.out) || 0) + (Number(r.think) || 0)) / 1e6) * p[1];
+}
+function monEsc(x) {
+  return String(x == null ? '' : x).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+function monHHMM(ts) {
+  const d = new Date(Number(ts) || 0);
+  return d.toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+async function monRefresh(manual) {
+  if (monBusy) return;
+  monBusy = true;
+  const body = document.getElementById('monBody');
+  try {
+    const cid = (typeof activeConvId === 'string' && activeConvId) ? activeConvId : '';
+    const [sumRes, recentRes, ctxRes] = await Promise.all([
+      fetch('/api/usage/summary?days=7').catch(() => null),
+      fetch('/api/usage/recent?limit=14').catch(() => null),
+      fetch('/api/monitor/context?convId=' + encodeURIComponent(cid)).catch(() => null),
+    ]);
+    const sum = sumRes && sumRes.ok ? await sumRes.json() : null;
+    const recent = recentRes && recentRes.ok ? await recentRes.json() : null;
+    const ctx = ctxRes && ctxRes.ok ? await ctxRes.json() : null;
+    body.innerHTML = monRenderHtml(sum, recent, ctx);
+    const st = document.getElementById('monStatus');
+    if (st) st.textContent = sum ? ('近 7 天 ' + monUsd(sum.total && sum.total.cost_usd)) : '用量不可用';
+  } catch (e) {
+    body.innerHTML = '<div class="mon-empty">加载失败：' + monEsc(e.message) + '</div>';
+  } finally {
+    monBusy = false;
+  }
+}
+
+function monRenderHtml(sum, recent, ctx) {
+  const out = [];
+  const t = (sum && sum.total) || {};
+  const today = sum && sum.by_day && sum.by_day.length ? sum.by_day[sum.by_day.length - 1] : null;
+  const hitRate = t.in ? ((t.cached || 0) / t.in * 100) : 0;
+
+  out.push('<div class="mon-grid">');
+  out.push(`<div class="mon-stat"><div class="mon-stat-label">今日调用</div><div class="mon-stat-value">${today ? today.calls : 0}</div><div class="mon-stat-sub">${today ? monUsd(today.cost_usd) : '--'}</div></div>`);
+  out.push(`<div class="mon-stat"><div class="mon-stat-label">今日输入</div><div class="mon-stat-value">${monTok(today ? today.in : 0)}</div><div class="mon-stat-sub">输出 ${monTok(today ? today.out + today.think : 0)}</div></div>`);
+  out.push(`<div class="mon-stat"><div class="mon-stat-label">近 7 天花费</div><div class="mon-stat-value">${monUsd(t.cost_usd)}</div><div class="mon-stat-sub">${t.calls || 0} 次调用</div></div>`);
+  out.push(`<div class="mon-stat"><div class="mon-stat-label">缓存命中率</div><div class="mon-stat-value">${hitRate.toFixed(0)}%</div><div class="mon-stat-sub">${monTok(t.cached || 0)} / ${monTok(t.in || 0)}</div></div>`);
+  out.push('</div>');
+
+  // ---- 最近一次请求的「输入构成」 ----
+  out.push('<div class="mon-sec">最近一次请求的输入构成<small>' + (ctx && ctx.context ? monHHMM(ctx.context.at) : '暂无（发一条消息后再看）') + '</small></div>');
+  const c = ctx && ctx.context;
+  if (!c) {
+    out.push('<div class="mon-empty">还没有记录到请求。发一条消息，然后再点刷新。</div>');
+  } else {
+    const blockPairs = Object.entries(c.blocks || {}).filter(([, v]) => Number(v) > 0);
+    const blockTotal = blockPairs.reduce((a, [, v]) => a + Number(v), 0) || 1;
+    const palette = ['#8ab4f8', '#6fcf8f', '#d8c37a', '#c58af9', '#7ad0d8', '#e0a0a0', '#a0c8e0'];
+    out.push('<div class="mon-card">');
+    out.push(`<div class="mon-kv">
+      <b>模型</b><span>${monEsc(c.model)}${c.nativeSearch ? '<i class="mon-chip">内建搜索</i>' : ''}${c.cacheHit ? '<i class="mon-chip on">缓存命中</i>' : '<i class="mon-chip warn">未命中</i>'}</span>
+      <b>请求条数</b><span>${c.sent_msgs} / ${c.msgs} 条（已缓存 ${Math.max(0, c.msgs - c.sent_msgs)}）</span>
+      <b>估算输入</b><span>${monTok(c.est_total_tokens)} = 历史 ${monTok(c.est_window_tokens)} + 系统 ${monTok(c.est_sys_tokens)} + 工具 ${monTok(c.est_tools_tokens)}</span>
+      <b>工具数</b><span>${c.tools} 个${c.cache_tokens ? ' · 缓存 ' + monTok(c.cache_tokens) + ' tokens' : ''}</span>
+    </div>`);
+    if (blockPairs.length) {
+      out.push('<div class="mon-bar">');
+      blockPairs.forEach(([k, v], i) => {
+        const w = Math.max(1, Math.round(Number(v) / blockTotal * 100));
+        out.push(`<i style="width:${w}%;background:${palette[i % palette.length]}" title="${monEsc(k)} ${v} tokens"></i>`);
+      });
+      out.push('</div>');
+      out.push('<div class="mon-kv">' + blockPairs.map(([k, v], i) =>
+        `<b><i style="display:inline-block;width:7px;height:7px;border-radius:2px;background:${palette[i % palette.length]};margin-right:5px"></i>${monEsc(k)}</b><span>${monTok(v)}</span>`
+      ).join('') + '</div>');
+    }
+    out.push('</div>');
+  }
+
+  // ---- 当前对话最近一条回复（前端本地数据，含模态分解）----
+  let lastMsg = null;
+  try {
+    const arr = (typeof messages !== 'undefined' && Array.isArray(messages)) ? messages : [];
+    for (let i = arr.length - 1; i >= 0; i--) {
+      if (arr[i] && arr[i].role === 'model' && arr[i].usageMetadata) { lastMsg = arr[i]; break; }
+    }
+  } catch (e) { lastMsg = null; }
+  out.push('<div class="mon-sec">当前对话最近一条回复<small>' + (lastMsg ? monEsc(lastMsg.model || '') + ' · ' + monEsc(lastMsg.time || '') : '暂无') + '</small></div>');
+  if (!lastMsg) {
+    out.push('<div class="mon-empty">这条对话还没有带用量数据的回复。</div>');
+  } else {
+    const u = lastMsg.usageMetadata || {};
+    const det = (u.promptTokensDetails || []).filter(x => Number(x.tokenCount) > 0);
+    const detTotal = det.reduce((a, x) => a + Number(x.tokenCount), 0) || 1;
+    const modalColor = { TEXT: '#8ab4f8', IMAGE: '#6fcf8f', AUDIO: '#d8c37a', VIDEO: '#c58af9', DOCUMENT: '#7ad0d8' };
+    const cached = Number(u.cachedContentTokenCount) || 0;
+    out.push('<div class="mon-card">');
+    out.push(`<div class="mon-kv">
+      <b>输入 tokens</b><span>${monTok(u.promptTokenCount)}${cached ? '（缓存 ' + monTok(cached) + '，省 $' + (((cached / 1e6) * ((MODEL_PRICING[lastMsg.model] || [0])[0] || 0) * 0.75).toFixed(4)) + '）' : ''}</span>
+      <b>输出 / 思考</b><span>${monTok(u.candidatesTokenCount)} / ${monTok(u.thoughtsTokenCount)}</span>
+      <b>本条估价</b><span>${monUsd(monCost({ model: lastMsg.model, in: u.promptTokenCount, out: u.candidatesTokenCount, think: u.thoughtsTokenCount, cached }))}</span>
+      <b>搜索来源</b><span>${(lastMsg.searchSources || []).length} 条 · RAG ${(lastMsg.ragResults || []).length} 条</span>
+    </div>`);
+    if (det.length) {
+      out.push('<div class="mon-bar">');
+      det.forEach(x => out.push(`<i style="width:${Math.max(1, Math.round(Number(x.tokenCount) / detTotal * 100))}%;background:${modalColor[x.modality] || '#888'}" title="${x.modality} ${x.tokenCount}"></i>`));
+      out.push('</div>');
+      out.push('<div class="mon-kv">' + det.map(x =>
+        `<b><i style="display:inline-block;width:7px;height:7px;border-radius:2px;background:${modalColor[x.modality] || '#888'};margin-right:5px"></i>${monEsc(x.modality)}</b><span>${monTok(x.tokenCount)}</span>`
+      ).join('') + '</div>');
+    }
+    out.push('</div>');
+  }
+
+  // ---- 近 7 天按天 ----
+  out.push('<div class="mon-sec">近 7 天<small>每天 0 点切分（UTC）</small></div>');
+  if (!sum || !sum.by_day || !sum.by_day.length) {
+    out.push('<div class="mon-empty">还没有落盘数据（USAGE_LOG 是否关掉了？）</div>');
+  } else {
+    out.push('<table class="mon-table"><thead><tr><th>日期</th><th>调用</th><th>输入</th><th>命中</th><th>输出</th><th>花费</th></tr></thead><tbody>');
+    for (const d of sum.by_day.slice().reverse()) {
+      out.push(`<tr><td>${d.date.slice(5)}</td><td>${d.calls}</td><td>${monTok(d.in)}</td><td class="${d.cached ? 'hit' : 'muted'}">${monTok(d.cached)}</td><td>${monTok(d.out + d.think)}</td><td>${monUsd(d.cost_usd)}</td></tr>`);
+    }
+    out.push('</tbody></table>');
+  }
+
+  // ---- 按模型 ----
+  if (sum && sum.by_model && sum.by_model.length) {
+    out.push('<div class="mon-sec">按模型（近 7 天）</div>');
+    out.push('<table class="mon-table"><thead><tr><th>模型</th><th>调用</th><th>输入</th><th>命中</th><th>输出</th><th>花费</th></tr></thead><tbody>');
+    for (const m of sum.by_model) {
+      out.push(`<tr><td>${monEsc(m.model)}</td><td>${m.calls}</td><td>${monTok(m.in)}</td><td class="${m.cached ? 'hit' : 'muted'}">${monTok(m.cached)}</td><td>${monTok(m.out + m.think)}</td><td>${monUsd(m.cost_usd)}</td></tr>`);
+    }
+    out.push('</tbody></table>');
+  }
+
+  // ---- 最近调用 ----
+  out.push('<div class="mon-sec">最近调用<small>每笔都在 usage/*.jsonl 里</small></div>');
+  if (recent && recent.items && recent.items.length) {
+    out.push('<table class="mon-table"><thead><tr><th>时间</th><th>模型</th><th>类型</th><th>输入</th><th>命中</th><th>花费</th></tr></thead><tbody>');
+    for (const r of recent.items) {
+      const kind = r.kind === 'proactive_stage2' ? '主动' : r.kind === 'proactive_gate1' ? '决策门' : '聊天';
+      out.push(`<tr><td>${monHHMM(r.ts)}</td><td>${monEsc(r.model)}</td><td>${kind}</td><td>${monTok(r.in)}</td><td class="${r.cached ? 'hit' : 'muted'}">${monTok(r.cached)}</td><td>${monUsd(r.cost_usd != null ? r.cost_usd : monCost(r))}</td></tr>`);
+    }
+    out.push('</tbody></table>');
+  } else {
+    out.push('<div class="mon-empty">暂无调用记录。</div>');
+  }
+
+  // ---- 缓存状态 ----
+  if (ctx) {
+    out.push('<div class="mon-sec">上下文缓存<small>' + (ctx.cache_enabled ? ('开 · TTL ' + ctx.cache_ttl_s + 's') : '已关闭') + '</small></div>');
+    if (ctx.caches && ctx.caches.length) {
+      out.push('<table class="mon-table"><thead><tr><th>对话</th><th>模型</th><th>缓存条数</th><th>tokens</th><th>剩余</th></tr></thead><tbody>');
+      for (const k of ctx.caches) {
+        out.push(`<tr><td>${monEsc(String(k.convId).slice(0, 18))}</td><td>${monEsc(k.model)}</td><td>${k.msgs}</td><td>${monTok(k.tokens)}</td><td>${Math.round(k.expires_in_s / 60)} 分</td></tr>`);
+      }
+      out.push('</tbody></table>');
+    } else {
+      out.push('<div class="mon-empty">当前没有活跃缓存（上下文累计够 ' + monTok(ctx.cache_min_tokens) + ' tokens 才会建）。</div>');
+    }
+  }
+
+  out.push('<div class="mon-note">提示：缓存命中后输入只按 25% 计价，但请求里不能再带 system/tools（它们进缓存），所以每轮变化的环境块会作为一条 user 消息附在最后。</div>');
+  return out.join('');
 }
 
 // ===== D.O. Dashboard =====

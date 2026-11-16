@@ -1382,9 +1382,17 @@ const GEMINI_CACHE_TAIL_MSGS = Math.max(2, Number(process.env.GEMINI_CACHE_TAIL_
 const GEMINI_CACHE_MAX_TAIL = Math.max(4, Number(process.env.GEMINI_CACHE_MAX_TAIL || 16));  // 尾巴涨到这么多条就重建
 const geminiCaches = new Map();   // convId → {name, model, keyHash, nMsgs, tokens, exp, hash}
 
-function geminiCacheSupported(model, nativeSearch) {
+// 最近一次请求的「输入构成」快照（给监控台看：各注入块多大、tools 几个、有没有走缓存）
+const lastContextInfo = new Map();   // convId → {...}
+function recordContextInfo(convId, info) {
+  try {
+    lastContextInfo.set(String(convId || '__default__'), { at: Date.now(), ...info });
+    if (lastContextInfo.size > 50) lastContextInfo.delete(lastContextInfo.keys().next().value);
+  } catch {}
+}
+
+function geminiCacheSupported(model) {
   if (!GEMINI_CACHE_ON || !model) return false;
-  if (nativeSearch) return false;                              // 内建 grounding 与 cachedContents 不混用
   if (!/^gemini-(2\.5|3|4)/.test(model)) return false;
   if (/image|nano-banana/.test(model)) return false;           // 图像模型不走缓存
   return true;
@@ -1394,12 +1402,18 @@ function keyHashOf(apiKey) { return sha12(String(apiKey || '')); }
 function contentsHash(contents) {
   try { return sha12(JSON.stringify(contents || [])); } catch { return ''; }
 }
-async function createGeminiCache(apiKey, model, contents) {
+async function createGeminiCache(apiKey, model, contents, sysText, tools, toolConfig) {
+  // 注意：systemInstruction / tools / toolConfig 必须和 contents 一起进缓存，
+  // 用了 cachedContent 的请求里再带这三样会 400（实测报错见 CLAUDE.md）
+  const body = { model: `models/${model}`, contents, ttl: `${GEMINI_CACHE_TTL_S}s` };
+  if (sysText) body.systemInstruction = { parts: [{ text: sysText }] };
+  if (Array.isArray(tools) && tools.length) body.tools = tools;
+  if (toolConfig) body.toolConfig = toolConfig;
   const r = await geminiHttps({
     url: `https://generativelanguage.googleapis.com/v1beta/cachedContents?key=${encodeURIComponent(apiKey)}`,
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: `models/${model}`, contents, ttl: `${GEMINI_CACHE_TTL_S}s` }),
+    body: JSON.stringify(body),
     timeout: 90000,
   });
   if (r.status !== 200) throw new Error(`cachedContents ${r.status}: ${String(r.body || '').slice(0, 200)}`);
@@ -3426,6 +3440,11 @@ function handleRequest(req, res) {
     return handleUsageRoutes(req, res);
   }
 
+  // --- 监控台：最近一次请求的输入构成 ---
+  if ((req.url || '').split('?')[0].startsWith('/api/monitor/')) {
+    return handleMonitorRoutes(req, res);
+  }
+
   // --- Health DB upload ---
   if (req.method === 'POST' && req.url === '/api/upload-health-db') {
     const chunks = [];
@@ -4199,37 +4218,79 @@ function handleRequest(req, res) {
 
       // ===== Gemini 分支 =====
       const streamPath = `/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
-      const reqBody = { contents: trimmedContents };
 
-      // 上下文缓存：命中就把历史前缀换成 cachedContent，本次只发尾巴
-      let geminiCacheUsed = null;
-      if (geminiCacheSupported(model, geminiNativeSearch)) {
-        const cKey = convId || '__default__';
-        const rec = geminiCaches.get(cKey);
-        const newerThanRec = rec && rec.nMsgs < trimmedContents.length;
-        if (rec && newerThanRec && rec.model === model && rec.exp > Date.now() + 60000
-            && rec.keyHash === keyHashOf(apiKey)
-            && contentsHash(trimmedContents.slice(0, rec.nMsgs)) === rec.hash) {
-          reqBody.cachedContent = rec.name;
-          reqBody.contents = trimmedContents.slice(rec.nMsgs);
-          geminiCacheUsed = rec;
-          console.log(`[cache] 命中 conv=${cKey} 前缀 ${rec.nMsgs} 条 / ${rec.tokens} tokens，本次只发 ${trimmedContents.length - rec.nMsgs} 条`);
+      // ---- 缓存策略：system prompt 拆「稳定（进缓存）/ 易变（每轮随请求发）」----
+      // 硬约束（2026-11 实测）：带 cachedContent 的请求里**不能再出现** systemInstruction / tools / toolConfig
+      //（报错 "CachedContent can not be used with GenerateContent request setting system_instruction, tools or tool_config"），
+      // 它们必须一起塞进缓存。所以：persona + 规则（稳定）+ tools 进缓存，
+      // 健康/天气/记忆/工具记录这些「每轮都变」的块挪到请求里的第一条 user 消息。
+      const stableSysText = existingSysText + saveGuidance + lockAppGuidance + webSearchGuidance;
+      const volatileText = [weatherBlock, healthBlock, screenBlock, auditBlock, memoryBlock, toolHistoryBlock, contextLine]
+        .map(x => (x || '').trim()).filter(Boolean).join('\n\n');
+      const volatileMsg = volatileText
+        ? [{ role: 'user', parts: [{ text: '【本轮环境数据（每轮刷新，仅供参考，不必复述）】\n' + volatileText }] }]
+        : [];
+      // 缓存里的 tools 必须稳定，否则每轮签名都变 → 每轮重建：不随 ragMemory/健康缓存浮动
+      const cacheDecls = [];
+      if (webSearchEnabled && !geminiNativeSearch) cacheDecls.push(WEB_SEARCH_TOOL);
+      cacheDecls.push(SAVE_MEMORY_TOOL, GET_HEALTH_TREND_TOOL, LOCK_APP_TOOL, AUTOCLI_TOOL, SCHEDULE_NUDGE_TOOL);
+      const cacheTools = geminiNativeSearch
+        ? [...cacheDecls, { google_search: {} }]
+        : cacheDecls;
+      const cacheToolConfig = geminiNativeSearch ? { includeServerSideToolInvocations: true } : null;
+
+      const reqBody = { contents: trimmedContents };
+      const applyFullBody = () => {
+        reqBody.contents = trimmedContents;
+        delete reqBody.cachedContent;
+        if (finalSysText) reqBody.systemInstruction = { parts: [{ text: finalSysText }] };
+        if (mergedTools.length > 0) {
+          reqBody.tools = [...mergedTools];
+          if (geminiNativeSearch) reqBody.tools.push({ google_search: {} });
+          if (geminiNativeSearch) reqBody.toolConfig = { includeServerSideToolInvocations: true };
+        } else {
+          delete reqBody.tools;
+          delete reqBody.toolConfig;
+          if (geminiNativeSearch) reqBody.tools = [{ google_search: {} }];
         }
-        // 没命中（或尾巴太长 / 快过期）就在后台重建，本次请求仍走全量
+      };
+
+      let geminiCacheUsed = null;
+      let cacheMode = false;
+      if (geminiCacheSupported(model)) {
+        const cKey = convId || '__default__';
+        const keyHash = keyHashOf(apiKey);
+        const rec = geminiCaches.get(cKey);
+        // 签名要覆盖「前缀 + 稳定 system + tools」，三者任一变化都得重建
+        const sigHash = (prefix) => contentsHash({ prefix, sys: stableSysText, tools: cacheTools });
+
+        if (rec && rec.model === model && rec.exp > Date.now() + 60000 && rec.keyHash === keyHash
+            && rec.nMsgs < trimmedContents.length
+            && sigHash(trimmedContents.slice(0, rec.nMsgs)) === rec.hash) {
+          reqBody.cachedContent = rec.name;
+          reqBody.contents = [...volatileMsg, ...trimmedContents.slice(rec.nMsgs)];
+          delete reqBody.systemInstruction;
+          delete reqBody.tools;
+          delete reqBody.toolConfig;
+          geminiCacheUsed = rec;
+          cacheMode = true;
+          console.log(`[cache] 命中 conv=${cKey} 前缀 ${rec.nMsgs} 条 / ${rec.tokens} tokens，本次只发 ${trimmedContents.length - rec.nMsgs} 条 + 环境块`);
+        }
+
+        // 没命中（或尾巴太长 / 快过期）→ 后台按当前稳定段重建；本次请求仍走全量，行为不变
         const nMsgs = trimmedContents.length - GEMINI_CACHE_TAIL_MSGS;
         const needRebuild = !geminiCacheUsed && nMsgs > 0
           && (!rec || rec.model !== model || rec.exp - Date.now() < 600000
               || trimmedContents.length - rec.nMsgs > GEMINI_CACHE_MAX_TAIL
-              || rec.keyHash !== keyHashOf(apiKey));
+              || rec.keyHash !== keyHash);
         if (needRebuild) {
           const prefix = trimmedContents.slice(0, nMsgs);
-          const est = estimateTokens(prefix);
+          const est = estimateTokens(prefix) + estimateTextTokens(stableSysText) + estimateToolsTokens(cacheTools);
           if (est >= GEMINI_CACHE_MIN_TOKENS) {
-            const h = contentsHash(prefix);
-            // 前缀没变就别重复建（每建一次都是新的存储账单）
+            const h = sigHash(prefix);
             if (!rec || rec.hash !== h) {
-              const capturedKey = keyHashOf(apiKey);
-              createGeminiCache(apiKey, model, prefix).then(({ name, tokens }) => {
+              const capturedKey = keyHash;
+              createGeminiCache(apiKey, model, prefix, stableSysText, cacheTools, cacheToolConfig).then(({ name, tokens }) => {
                 geminiCaches.set(cKey, {
                   name, model, keyHash: capturedKey, nMsgs, tokens, hash: h,
                   exp: Date.now() + GEMINI_CACHE_TTL_S * 1000,
@@ -4240,6 +4301,35 @@ function handleRequest(req, res) {
           }
         }
       }
+      if (!cacheMode) applyFullBody();
+
+      recordContextInfo(convId, {
+        model,
+        msgs: trimmedContents.length,
+        est_window_tokens: estimateTokens(trimmedContents),
+        est_sys_tokens: estimateTextTokens(finalSysText),
+        est_tools_tokens: estimateToolsTokens(mergedTools),
+        est_total_tokens: estimateTokens(trimmedContents) + estimateTextTokens(finalSysText) + estimateToolsTokens(mergedTools),
+        blocks: {
+          '人设/规则': estimateTextTokens(existingSysText),
+          '存记忆指引': estimateTextTokens(saveGuidance),
+          '应用锁': estimateTextTokens(lockAppGuidance),
+          '联网搜索': estimateTextTokens(webSearchGuidance),
+          '天气': estimateTextTokens(weatherBlock),
+          '健康': estimateTextTokens(healthBlock),
+          '屏幕': estimateTextTokens(screenBlock),
+          '记账': estimateTextTokens(auditBlock),
+          '记忆': estimateTextTokens(memoryBlock),
+          '工具记录': estimateTextTokens(toolHistoryBlock),
+          '上下文行': estimateTextTokens(contextLine),
+        },
+        tools: mergedTools.length + (geminiNativeSearch ? 1 : 0),
+        nativeSearch: !!geminiNativeSearch,
+        cacheHit: !!geminiCacheUsed,
+        cacheMode,
+        cache_tokens: geminiCacheUsed ? geminiCacheUsed.tokens : 0,
+        sent_msgs: cacheMode ? reqBody.contents.length : trimmedContents.length,
+      });
 
       // systemInstruction 终稿已在上面算好（finalSysText）
       if (finalSysText) {
@@ -4267,17 +4357,7 @@ function handleRequest(req, res) {
         reqBody.generationConfig = generationConfig;
       }
 
-      // 工具：函数声明 +（Gemini 3+）内建 Google Search grounding
-      if (mergedTools.length > 0) {
-        reqBody.tools = [...mergedTools];
-      }
-      if (geminiNativeSearch) {
-        reqBody.tools = [...(reqBody.tools || []), { google_search: {} }];
-        if (mergedTools.length > 0) {
-          // 内建工具 + 函数声明混用时需要这个开关（gemini-3+ 才支持）
-          reqBody.toolConfig = { ...(reqBody.toolConfig || {}), includeServerSideToolInvocations: true };
-        }
-      }
+      // 工具 / systemInstruction 已在上面由 applyFullBody() 或缓存分支决定，这里不再覆盖
 
       // SSE headers
       res.writeHead(200, {
@@ -4327,7 +4407,8 @@ function handleRequest(req, res) {
         const preStripped = stripDeadMediaParts(reqBody.contents);
         if (preStripped.stripped > 0) {
           reqBody.contents = preStripped.contents;
-          trimmedContents = preStripped.contents;   // followup 用的是 trimmedContents，必须同步，否则它又把死附件带回去 → 403
+          // followup 用的是 trimmedContents（非缓存模式），必须同步，否则它又把死附件带回去 → 403
+          if (!cacheMode) trimmedContents = preStripped.contents;
           sseSend({ type: 'tool_call', tool: 'media_expired', detail: `${preStripped.stripped} 个附件已过期，已跳过` });
         }
 
@@ -4341,8 +4422,8 @@ function handleRequest(req, res) {
           if (reqBody.cachedContent && /cachedContent|cached_content|cache/i.test(preErrBody)) {
             console.warn('[cache] 缓存不可用，去掉 cachedContent 重试:', preErrBody.slice(0, 200));
             geminiCaches.delete(convId || '__default__');
-            delete reqBody.cachedContent;
-            reqBody.contents = trimmedContents;
+            cacheMode = false;
+            applyFullBody();          // 恢复 systemInstruction + tools + 全量 contents
             geminiRes = await callGeminiRaw(streamPath, reqBody);
             preErrBody = geminiRes.statusCode !== 200 ? await collectStreamText(geminiRes) : '';
           }
@@ -4586,14 +4667,20 @@ function handleRequest(req, res) {
                 const followupTools = (reqBody.tools || []).filter(t =>
                   !(t.functionDeclarations || []).some(f => FUNCTION_CALL_NAMES.includes(f.name))
                 );
+                // 缓存模式下真正发出去的是 reqBody.contents（环境块 + 尾巴），tools/toolConfig 在缓存里
+                const followupBase = cacheMode ? reqBody.contents : trimmedContents;
                 const followupBody = {
                   ...reqBody,
-                  contents: [...trimmedContents, modelContent, { role: 'user', parts: functionResponses }],
+                  contents: [...followupBase, modelContent, { role: 'user', parts: functionResponses }],
                 };
-                if (followupTools.length > 0) {
-                  followupBody.tools = followupTools;
+                if (!cacheMode) {
+                  if (followupTools.length > 0) {
+                    followupBody.tools = followupTools;
+                  } else {
+                    delete followupBody.tools;
+                  }
                 } else {
-                  delete followupBody.tools;
+                  delete followupBody.tools;     // 缓存里已有 tools，请求里再带会 400
                 }
                 // includeServerSideToolInvocations only for gemini-2.0
                 delete followupBody.toolConfig;
@@ -5919,8 +6006,34 @@ function auditParseRangeParam(v, isEnd = false) {
 
 async function handleUsageRoutes(req, res) {
   const q = new URL(req.url, 'http://x').searchParams;
+  const sub = (req.url || '').split('?')[0].split('/').pop();
+
+  // --- 最近 N 条调用明细 ---
+  if (sub === 'recent') {
+    const limit = Math.max(1, Math.min(200, Number(q.get('limit')) || 20));
+    const out = [];
+    const d = new Date();
+    for (let back = 0; back < 3 && out.length < limit; back++) {
+      const day = new Date(d.getTime() - back * 86400000).toISOString().slice(0, 10);
+      const f = path.join(USAGE_DIR, `usage-${day}.jsonl`);
+      if (!fs.existsSync(f)) continue;
+      const lines = fs.readFileSync(f, 'utf8').trim().split('\n');
+      for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+        if (!lines[i].trim()) continue;
+        try {
+          const r = JSON.parse(lines[i]);
+          out.push({ ...r, cost_usd: Math.round(usageCostUsd(r) * 1e4) / 1e4 });
+        } catch {}
+      }
+    }
+    const body = JSON.stringify({ ok: true, items: out, enabled: USAGE_LOG_ON });
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(body);
+    return;
+  }
+
   const days = Math.max(1, Math.min(90, Number(q.get('days')) || 7));
-  const send = (code, obj) => {
+  const sendJson = (code, obj) => {
     const body = JSON.stringify(obj);
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(body);
@@ -5964,7 +6077,7 @@ async function handleUsageRoutes(req, res) {
     total.cost_usd = round(total.cost_usd);
     const models = [...byModel.values()].map(m => ({ ...m, cost_usd: round(m.cost_usd) }))
       .sort((a, b) => b.cost_usd - a.cost_usd);
-    return send(200, {
+    return sendJson(200, {
       ok: true,
       days,
       from: dayKeys[0], to: dayKeys[dayKeys.length - 1],
@@ -5975,8 +6088,29 @@ async function handleUsageRoutes(req, res) {
       enabled: USAGE_LOG_ON,
     });
   } catch (e) {
-    return send(500, { ok: false, error: e.message });
+    return sendJson(500, { ok: false, error: e.message });
   }
+}
+
+// 监控台：最近一次请求的输入构成（内存里的快照，不花钱）
+function handleMonitorRoutes(req, res) {
+  const q = new URL(req.url, 'http://x').searchParams;
+  const convId = q.get('convId') || '';
+  const info = lastContextInfo.get(convId) || lastContextInfo.get('__default__') || null;
+  const caches = [...geminiCaches.entries()].map(([cid, r]) => ({
+    convId: cid, model: r.model, msgs: r.nMsgs, tokens: r.tokens,
+    expires_in_s: Math.max(0, Math.round((r.exp - Date.now()) / 1000)),
+  }));
+  const body = JSON.stringify({
+    ok: true,
+    context: info,
+    caches,
+    cache_enabled: GEMINI_CACHE_ON,
+    cache_ttl_s: GEMINI_CACHE_TTL_S,
+    cache_min_tokens: GEMINI_CACHE_MIN_TOKENS,
+  });
+  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(body);
 }
 
 async function handleAuditRoutes(req, res) {
