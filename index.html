@@ -3931,15 +3931,20 @@ function deepseekIsPeak(now = new Date()) {
   return (h >= 9 && h < 12) || (h >= 14 && h < 18);
 }
 
+// 统一的计价口径（消息气泡 / Monitor / 服务端 usageCostUsd 三处必须一致）：
+//   输入 = 未命中缓存的部分按全价，命中缓存的部分按全价 25%
+//   输出 = candidates + thoughts（思考 token 也计费）
 function calcCost(usage, modelId) {
   if (!usage || !modelId) return null;
-  const inTok = usage.promptTokenCount || 0;
+  const inTokRaw = usage.promptTokenCount || 0;
+  const cachedTok = Math.min(Number(usage.cachedContentTokenCount) || 0, inTokRaw);
+  const inTok = Math.max(0, inTokRaw - cachedTok);
   let outTok = (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0);
-  // DeepSeek：人民币峰谷价（输入按缓存未命中，保守估算）
+  // DeepSeek：人民币峰谷价（它自己的缓存价我们没记录，输入一律按 miss 价，保守估算）
   const dp = DEEPSEEK_PRICING[modelId];
   if (dp) {
     const peak = deepseekIsPeak();
-    return (inTok * dp.miss[peak ? 'peak' : 'offpeak'] + outTok * dp.out[peak ? 'peak' : 'offpeak']) / 1e6;
+    return (inTokRaw * dp.miss[peak ? 'peak' : 'offpeak'] + outTok * dp.out[peak ? 'peak' : 'offpeak']) / 1e6;
   }
   const p = MODEL_PRICING[modelId];
   if (!p) return null;
@@ -3949,7 +3954,7 @@ function calcCost(usage, modelId) {
     const d = usage.candidatesTokensDetails.find(x => String(x.modality || '').toUpperCase().includes('IMAGE'));
     if (d && d.tokenCount) { imgTok = d.tokenCount; outTok = Math.max(0, outTok - imgTok); }
   }
-  return (inTok * p[0] + outTok * p[1] + imgTok * (p[2] || p[1])) / 1e6;
+  return (inTok * p[0] + cachedTok * p[0] * 0.25 + outTok * p[1] + imgTok * (p[2] || p[1])) / 1e6;
 }
 
 function fmtCost(cost, modelId) {
@@ -3973,7 +3978,7 @@ function buildUsageInner(usage, modelId) {
   if (cost != null) {
     let tip = '';
     if (DEEPSEEK_PRICING[modelId]) tip = deepseekIsPeak() ? '（高峰价）' : '（低谷价）';
-    parts.push(`<span style="color:#e8c87a" title="按官方价估算，不含缓存折扣/免费额度">≈${fmtCost(cost, modelId)}${tip}</span>`);
+    parts.push(`<span style="color:#e8c87a" title="按官方价估算：命中缓存的部分按 25% 计价；不含免费额度">≈${fmtCost(cost, modelId)}${tip}</span>`);
   }
   return parts.join('');
 }
@@ -6911,13 +6916,14 @@ function monUsd(v) {
   v = Number(v) || 0;
   return '$' + (v >= 10 ? v.toFixed(1) : v >= 1 ? v.toFixed(2) : v.toFixed(3));
 }
-// 与服务端 usageCostUsd 同口径：缓存命中部分按输入价 25%
+// 与消息气泡/服务端同一口径（直接复用 calcCost，别再各写一套）
 function monCost(r) {
-  const p = MODEL_PRICING[r.model];
-  if (!p) return 0;
-  const cached = Math.min(Number(r.cached) || 0, Number(r.in) || 0);
-  const fresh = Math.max(0, (Number(r.in) || 0) - cached);
-  return (fresh / 1e6) * p[0] + (cached / 1e6) * p[0] * 0.25 + (((Number(r.out) || 0) + (Number(r.think) || 0)) / 1e6) * p[1];
+  return calcCost({
+    promptTokenCount: Number(r.in) || 0,
+    candidatesTokenCount: Number(r.out) || 0,
+    thoughtsTokenCount: Number(r.think) || 0,
+    cachedContentTokenCount: Number(r.cached) || 0,
+  }, r.model) || 0;
 }
 function monEsc(x) {
   return String(x == null ? '' : x).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
