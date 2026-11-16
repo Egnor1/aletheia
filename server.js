@@ -4224,7 +4224,10 @@ function handleRequest(req, res) {
       //（报错 "CachedContent can not be used with GenerateContent request setting system_instruction, tools or tool_config"），
       // 它们必须一起塞进缓存。所以：persona + 规则（稳定）+ tools 进缓存，
       // 健康/天气/记忆/工具记录这些「每轮都变」的块挪到请求里的第一条 user 消息。
-      const stableSysText = existingSysText + saveGuidance + lockAppGuidance + webSearchGuidance;
+      // 注意：这里只能用「跟数据无关」的常量。saveGuidance 原本依赖 ragMemory（这轮有没有检索到记忆），
+      // 一会有一会没有 → 稳定段变来变去 → 缓存签名每轮都不同 → 建了缓存却永远命中不了。
+      const saveGuidanceStable = SAVE_MEMORY_PROMPT;
+      const stableSysText = existingSysText + saveGuidanceStable + lockAppGuidance + webSearchGuidance;
       const volatileText = [weatherBlock, healthBlock, screenBlock, auditBlock, memoryBlock, toolHistoryBlock, contextLine]
         .map(x => (x || '').trim()).filter(Boolean).join('\n\n');
       const volatileMsg = volatileText
@@ -4261,38 +4264,62 @@ function handleRequest(req, res) {
         const cKey = convId || '__default__';
         const keyHash = keyHashOf(apiKey);
         const rec = geminiCaches.get(cKey);
-        // 签名要覆盖「前缀 + 稳定 system + tools」，三者任一变化都得重建
-        const sigHash = (prefix) => contentsHash({ prefix, sys: stableSysText, tools: cacheTools });
+        // 签名要覆盖「稳定 system + tools」，任一变化都得重建
+        const sigSys = contentsHash({ sys: stableSysText, tools: cacheTools });
+        const msgHash = (m) => { try { return sha12(JSON.stringify(m)); } catch { return ''; } };
+        // 命中判定用「锚点」：缓存里最后两条消息的指纹。
+        // 前端会在拿到 context_state 后裁剪历史（offset 往前跳），此时按数组下标比对必然错位 →
+        // 改成在新内容里找这两个锚点，找到就说明「缓存那段在这轮里仍然存在且连续」。
+        const findAnchor = (list, aA, aB) => {
+          if (!aA || !aB || list.length < 2) return -1;
+          for (let i = list.length - 1; i >= 1; i--) {
+            if (msgHash(list[i]) === aA && msgHash(list[i - 1]) === aB) return i;
+          }
+          return -1;
+        };
 
-        if (rec && rec.model === model && rec.exp > Date.now() + 60000 && rec.keyHash === keyHash
-            && rec.nMsgs < trimmedContents.length
-            && sigHash(trimmedContents.slice(0, rec.nMsgs)) === rec.hash) {
+        const recValid = !!(rec && rec.model === model && rec.exp > Date.now() + 60000 && rec.keyHash === keyHash
+            && rec.sigSys === sigSys);
+        const anchorIdx = recValid ? findAnchor(trimmedContents, rec.anchorA, rec.anchorB) : -1;
+        const recHashOk = recValid && anchorIdx >= 0 && anchorIdx + 1 < trimmedContents.length;
+        if (rec && !recHashOk && rec.model === model && rec.keyHash === keyHash) {
+          const why = rec.exp - Date.now() <= 60000 ? '快过期'
+            : !recValid ? '系统段/工具或 key 变了'
+            : anchorIdx < 0 ? '锚点已不在本次内容里（历史被裁过）'
+            : '锚点就在末尾，没有新内容';
+          console.log(`[cache] 不命中（${why}）：缓存 ${rec.nMsgs} 条 / 本次 ${trimmedContents.length} 条`);
+        }
+        if (recHashOk) {
           reqBody.cachedContent = rec.name;
-          reqBody.contents = [...volatileMsg, ...trimmedContents.slice(rec.nMsgs)];
+          reqBody.contents = [...volatileMsg, ...trimmedContents.slice(anchorIdx + 1)];
           delete reqBody.systemInstruction;
           delete reqBody.tools;
           delete reqBody.toolConfig;
           geminiCacheUsed = rec;
           cacheMode = true;
-          console.log(`[cache] 命中 conv=${cKey} 前缀 ${rec.nMsgs} 条 / ${rec.tokens} tokens，本次只发 ${trimmedContents.length - rec.nMsgs} 条 + 环境块`);
+          console.log(`[cache] 命中 conv=${cKey} 缓存 ${rec.nMsgs} 条 / ${rec.tokens} tokens，锚点在第 ${anchorIdx} 条，本次只发 ${trimmedContents.length - anchorIdx - 1} 条 + 环境块`);
         }
 
         // 没命中（或尾巴太长 / 快过期）→ 后台按当前稳定段重建；本次请求仍走全量，行为不变
         const nMsgs = trimmedContents.length - GEMINI_CACHE_TAIL_MSGS;
-        const needRebuild = !geminiCacheUsed && nMsgs > 0
-          && (!rec || rec.model !== model || rec.exp - Date.now() < 600000
-              || trimmedContents.length - rec.nMsgs > GEMINI_CACHE_MAX_TAIL
+        const needRebuild = !geminiCacheUsed && nMsgs >= 2
+          && (!rec || !recValid || !recHashOk
+              || rec.exp - Date.now() < 600000
+              || (recHashOk && trimmedContents.length - anchorIdx - 1 > GEMINI_CACHE_MAX_TAIL)
               || rec.keyHash !== keyHash);
         if (needRebuild) {
           const prefix = trimmedContents.slice(0, nMsgs);
           const est = estimateTokens(prefix) + estimateTextTokens(stableSysText) + estimateToolsTokens(cacheTools);
           if (est >= GEMINI_CACHE_MIN_TOKENS) {
-            const h = sigHash(prefix);
+            const h = contentsHash(prefix);
             if (!rec || rec.hash !== h) {
               const capturedKey = keyHash;
+              const aA = msgHash(prefix[nMsgs - 1]);
+              const aB = msgHash(prefix[nMsgs - 2]);
               createGeminiCache(apiKey, model, prefix, stableSysText, cacheTools, cacheToolConfig).then(({ name, tokens }) => {
                 geminiCaches.set(cKey, {
                   name, model, keyHash: capturedKey, nMsgs, tokens, hash: h,
+                  anchorA: aA, anchorB: aB, sigSys,
                   exp: Date.now() + GEMINI_CACHE_TTL_S * 1000,
                 });
                 console.log(`[cache] 已建立 conv=${cKey} 前缀 ${nMsgs} 条 / ≈${est} tokens (调用侧报 ${tokens})，TTL ${GEMINI_CACHE_TTL_S}s`);
