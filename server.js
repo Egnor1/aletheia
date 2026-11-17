@@ -1870,8 +1870,12 @@ const WEATHER_TZ = 'Asia/Shanghai';
 const WEATHER_PIN_IPS = String(process.env.WEATHER_PIN_IPS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const WEATHER_DEFAULT_PINS = {
-  // 顺序 = 尝试顺序，按实测延迟从快到慢（2026-11 服务器上 5.9.98.12 ≈160ms）
-  'api.open-meteo.com': ['5.9.98.12', '152.53.84.73', '178.63.121.29'],
+  // 顺序 = 尝试顺序。2026-11-17 实测：
+  //   5.9.98.12      正常（≈160ms）
+  //   178.63.121.29  正常
+  //   152.53.84.73   **返回 temperature_2m/weather_code 全 null 的残缺数据** → 已剔除
+  //   202.61.206.6   证书只签 geocoding 域，别用
+  'api.open-meteo.com': ['5.9.98.12', '178.63.121.29'],
 };
 const weatherPinnedIp = new Map();   // hostname → 最近一次成功的固定 IP
 
@@ -1969,30 +1973,35 @@ function httpsGetJson(url, timeoutMs = 6000, pinIp = '') {
 
 // 带「钉 IP 兜底」的 GET：先按 DNS 直连；失败则依次试固定 IP，并记住成功的那台
 // （下次直接用，省掉一轮超时）。成功过的 IP 失效时会被清掉重新探。
-async function httpsGetJsonWithFallback(url, timeoutMs = 6000) {
+// 注意：accept 回调用来校验「内容」而不只是 HTTP 200。
+// 2026-11-17 踩过：152.53.84.73 这台边缘 200 但 current 全是 null，解析成功 → 界面显示「0℃ 未知」，
+// 还把这个坏结果写进 weatherState 顶掉了好数据。现在内容不合格 = 这次失败，继续下一个 IP。
+async function httpsGetJsonWithFallback(url, timeoutMs = 6000, accept = null) {
   let host = '';
   try { host = new URL(url).hostname; } catch { return null; }
+  const ok = (v) => !!v && (typeof accept !== 'function' || accept(v));
 
   const cached = weatherPinnedIp.get(host);
   if (cached) {
     const r = await httpsGetJson(url, timeoutMs, cached);
-    if (r) return r;
+    if (ok(r)) return r;
     weatherPinnedIp.delete(host);
-    console.log(`[weather] ${host} 固定 IP ${cached} 失效，重新探测`);
+    console.log(`[weather] ${host} 固定 IP ${cached} ${r ? '返回内容不合格' : '连不上'}，重新探测`);
   }
 
   const direct = await httpsGetJson(url, Math.min(timeoutMs, 4000));
-  if (direct) return direct;
+  if (ok(direct)) return direct;
 
   // 直连不通才走固定 IP；记住成功的那台，之后每轮直接命中（省掉一次直连超时）
   const pins = WEATHER_PIN_IPS.length ? WEATHER_PIN_IPS : (WEATHER_DEFAULT_PINS[host] || []);
   for (const ip of pins) {
     const r = await httpsGetJson(url, timeoutMs, ip);
-    if (r) {
+    if (ok(r)) {
       weatherPinnedIp.set(host, ip);
       console.log(`[weather] ${host} 直连失败，改用固定 IP ${ip}（后续复用）`);
       return r;
     }
+    if (r) console.warn(`[weather] ${host} 固定 IP ${ip} 返回内容不合格，跳过`);
   }
   return null;
 }
@@ -2011,8 +2020,10 @@ async function fetchCityWeather(c) {
 
   // 两个请求都走「DNS 直连 → 钉 IP 兜底」：api.open-meteo.com 的 DNS 边缘在部分网络不可达
   const [fc, aq] = await Promise.all([
-    httpsGetJsonWithFallback(fUrl),
-    httpsGetJsonWithFallback(aUrl),
+    // 预报：current 里必须有数字温度与 weather_code，否则视为坏数据（别把 null 当成「0℃ 未知」显示）
+    httpsGetJsonWithFallback(fUrl, 6000, (d) =>
+      d && d.current && Number.isFinite(d.current.temperature_2m) && d.current.weather_code != null && !!d.daily),
+    httpsGetJsonWithFallback(aUrl, 6000, (d) => d && (d.current || d.hourly)),
   ]);
   if (!fc || !fc.current || !fc.daily) return null;
 
